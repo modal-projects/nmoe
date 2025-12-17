@@ -161,17 +161,59 @@ def train(cfg: Config):
 
 
 def main():
-  """Entry point. Loads config and starts training."""
+  """Entry point. Loads config and starts training.
+
+  Usage:
+    python -m nmoe.train <config.toml> [--key=value ...]
+
+  CLI overrides (applied after TOML):
+    --dtype=fp8        Override precision (bf16, fp8, nvfp4)
+    --steps=2000       Override training steps
+    --batch_size=16    Override batch size
+    --resume=false     Override resume behavior
+
+  Environment overrides (lowest priority):
+    NMOE_DTYPE, NMOE_STEPS, etc.
+  """
   if '--help' in sys.argv or '-h' in sys.argv:
     print(__doc__)
+    print(main.__doc__)
     sys.exit(0)
 
   if len(sys.argv) < 2:
-    print("Usage: python -m nmoe.train <config.toml>", file=sys.stderr)
+    print("Usage: python -m nmoe.train <config.toml> [--key=value ...]", file=sys.stderr)
     sys.exit(1)
 
+  # Load base config from TOML
   with open(sys.argv[1], 'rb') as f:
-    cfg = Config(**tomllib.load(f))
+    cfg_dict = tomllib.load(f)
+
+  # Apply environment variable overrides (NMOE_DTYPE, NMOE_STEPS, etc.)
+  for key in ['dtype', 'steps', 'batch_size', 'seq_len', 'resume']:
+    env_key = f'NMOE_{key.upper()}'
+    if env_key in os.environ:
+      val = os.environ[env_key]
+      # Parse booleans and ints
+      if val.lower() in ('true', 'false'):
+        val = val.lower() == 'true'
+      elif val.isdigit():
+        val = int(val)
+      cfg_dict[key] = val
+
+  # Apply CLI overrides (--key=value)
+  for arg in sys.argv[2:]:
+    if arg.startswith('--') and '=' in arg:
+      key, val = arg[2:].split('=', 1)
+      # Parse booleans and ints
+      if val.lower() in ('true', 'false'):
+        val = val.lower() == 'true'
+      elif val.lstrip('-').isdigit():
+        val = int(val)
+      elif val.replace('.', '', 1).lstrip('-').isdigit():
+        val = float(val)
+      cfg_dict[key] = val
+
+  cfg = Config(**cfg_dict)
 
   try:
     train(cfg)

@@ -41,7 +41,7 @@ lr_expert = 4.5e-2   # 15x dense LR to compensate for smaller expert gradients
 # Training Overrides
 # =============================================================================
 steps = 200
-dtype = "bf16"
+dtype = "nvfp4"
 batch_size = 64
 seq_len = 4096
 resume = false

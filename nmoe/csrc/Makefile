@@ -82,8 +82,7 @@ MUON_TARGET := $(OPT_DIR)/muon$(PYTHON_EXT_SUFFIX)
 FLASHMLA_TARGET := flashmla_sm100$(PYTHON_EXT_SUFFIX)
 
 # RDEP sources
-# rdep/rdep.cu is the new DeepEP-aligned dispatch/combine primitives
-RDEP_CUDA_SRCS := rdep.cu rdep/rdep.cu quant.cu ptx.cu adamw.cu lt_gemm.cu grouped_gemm.cu $(NVSHMEM_SRCS)
+RDEP_CUDA_SRCS := rdep.cu quant.cu ptx.cu adamw.cu lt_gemm.cu grouped_gemm.cu $(NVSHMEM_SRCS)
 # Compile bindings.cpp with BUILD_RDEP into a dedicated object to avoid flag clashes
 RDEP_CPP_OBJS := bindings_rdep.o
 
@@ -127,8 +126,7 @@ FLASHMLA_LDFLAGS := -shared \
 	-Wl,-rpath,$(TORCH_LIB_DIR) -Wl,-rpath,$(CUDA_HOME)/lib64
 
 # Objects
-# Note: rdep/rdep.cu → rdep/rdep.o needs special handling
-RDEP_CUDA_OBJS := rdep.o rdep/rdep.o quant.o ptx.o adamw.o lt_gemm.o grouped_gemm.o $(NVSHMEM_SRCS:.cu=.o)
+RDEP_CUDA_OBJS := rdep.o quant.o ptx.o adamw.o lt_gemm.o grouped_gemm.o $(NVSHMEM_SRCS:.cu=.o)
 # Explicit binding object for RDEP pybind module
 RDEP_CPP_OBJS := bindings_rdep.o
 DLINK_OBJ := dlink.o
@@ -185,17 +183,13 @@ $(FLASHMLA_TARGET): $(FLASHMLA_BWD_OBJ) $(FLASHMLA_CPP_OBJS)
 rdep.o: rdep.cu ptx.cu rdep_nvshmem.cuh
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
-# DeepEP-aligned dispatch/combine primitives
-rdep/rdep.o: rdep/rdep.cu rdep/configs.cuh rdep/utils.cuh rdep/exception.cuh rdep/contract.cuh
-	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
-
 quant.o: quant.cu ptx.cu
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
 ptx.o: ptx.cu
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
-rdep_nvshmem.o: rdep_nvshmem.cu rdep_nvshmem.cuh ptx.cu rdep/configs.cuh rdep/utils.cuh rdep/exception.cuh rdep/ibgda_device.cuh
+rdep_nvshmem.o: rdep_nvshmem.cu rdep_nvshmem.cuh ptx.cu
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
 $(FLASHMLA_BWD_OBJ): $(FLASHMLA_BWD_SRC)
@@ -220,8 +214,7 @@ clean:
 	rm -f $(RDEP_CUDA_OBJS) $(DLINK_OBJ) $(RDEP_CPP_OBJS) $(RDEP_TARGET) \
 		$(GPU_OBJS) $(GPU_TARGET) \
 		$(MUON_TARGET) $(MUON_CUDA_SRCS:.cu=.o) bindings_rdep.o bindings_muon.o $(MUON_DLINK_OBJ) \
-		$(FLASHMLA_BWD_OBJ) $(FLASHMLA_CPP_OBJS) $(FLASHMLA_TARGET) \
-		rdep/rdep.o
+		$(FLASHMLA_BWD_OBJ) $(FLASHMLA_CPP_OBJS) $(FLASHMLA_TARGET)
 
 # Debug build
 debug: NVCC_FLAGS += -g -G -DDEBUG

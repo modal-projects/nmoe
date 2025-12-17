@@ -791,7 +791,7 @@ __global__ void k_dispatch_bf16(
             if (is_remote) {
                 int4* meta_dst = reinterpret_cast<int4*>(&meta_buf[slot_r]);
                 int4 meta_val = *reinterpret_cast<const int4*>(&m);
-                st_na_v4_s32(meta_dst, meta_val);
+                st_relaxed_sys_v4_s32(meta_dst, meta_val);  // sys-scope for cross-GPU
             } else {
                 meta_buf[slot_r] = m;
             }
@@ -802,18 +802,18 @@ __global__ void k_dispatch_bf16(
         uint16_t* dst = x_buf + (int64_t)slot_r * Ha;
 
         if (is_remote) {
-            // Vectorized P2P writes
+            // Vectorized P2P writes - sys-scope for cross-GPU visibility
             int h = lane * 8;  // Each lane starts at different offset
             for (; h < H; h += 32 * 8) {
                 if (h + 8 <= H) {
                     int4* d = reinterpret_cast<int4*>(dst + h);
                     int4 v = *reinterpret_cast<const int4*>(row + h);
-                    st_na_v4_s32(d, v);
+                    st_relaxed_sys_v4_s32(d, v);
                 } else {
                     // Handle tail
                     for (int hh = h; hh < H && hh < h + 8; hh++) {
-                        st_na_relaxed_gpu_b16(reinterpret_cast<uint16_t*>(dst + hh),
-                                             *reinterpret_cast<const uint16_t*>(row + hh));
+                        st_relaxed_sys_b16(reinterpret_cast<uint16_t*>(dst + hh),
+                                           *reinterpret_cast<const uint16_t*>(row + hh));
                     }
                 }
             }
@@ -833,6 +833,9 @@ __global__ void k_dispatch_bf16(
             }
         }
     }
+
+    // Fence to ensure all sys-scope writes are visible before kernel completes
+    fence_acq_rel_sys();
 }
 
 // ============================================================================
@@ -902,11 +905,14 @@ __global__ void k_write_counts_to_dests_bf16(size_t recv_counts_off) {
     int* dest_recv_counts = reinterpret_cast<int*>(dest_buf + recv_counts_off);
 
     if (dest != my_rank) {
-        // P2P write
-        st_na_relaxed_gpu_b32(&dest_recv_counts[my_rank], count);
+        // P2P write - sys-scope for cross-GPU visibility
+        st_relaxed_sys_s32(&dest_recv_counts[my_rank], count);
     } else {
         dest_recv_counts[my_rank] = count;
     }
+
+    // Fence to ensure writes are sys-visible before kernel completes
+    fence_acq_rel_sys();
 }
 
 // Compute prefix sums from recv_counts and write offsets back to sources
@@ -935,11 +941,15 @@ __global__ void k_compute_and_write_offsets_bf16(size_t recv_counts_off, size_t 
         int* src_recv_offsets = reinterpret_cast<int*>(src_buf + recv_offsets_off);
 
         if (src != my_rank) {
-            st_na_relaxed_gpu_b32(&src_recv_offsets[my_rank], recv_offsets[src]);
+            // P2P write - sys-scope for cross-GPU visibility
+            st_relaxed_sys_s32(&src_recv_offsets[my_rank], recv_offsets[src]);
         } else {
             src_recv_offsets[my_rank] = recv_offsets[src];
         }
     }
+
+    // Fence to ensure writes are sys-visible before kernel completes
+    fence_acq_rel_sys();
 }
 
 // 2-Phase Dispatch: Deterministic write (Phase 2)
@@ -998,7 +1008,7 @@ __global__ void k_dispatch_2phase_bf16(
             if (is_remote) {
                 int4* meta_dst = reinterpret_cast<int4*>(&meta_buf[slot_r]);
                 int4 meta_val = *reinterpret_cast<const int4*>(&m);
-                st_na_v4_s32(meta_dst, meta_val);
+                st_relaxed_sys_v4_s32(meta_dst, meta_val);  // sys-scope for cross-GPU visibility
             } else {
                 meta_buf[slot_r] = m;
             }
@@ -1013,11 +1023,11 @@ __global__ void k_dispatch_2phase_bf16(
                 if (h + 8 <= H) {
                     int4* d = reinterpret_cast<int4*>(dst + h);
                     int4 v = *reinterpret_cast<const int4*>(row + h);
-                    st_na_v4_s32(d, v);
+                    st_relaxed_sys_v4_s32(d, v);  // sys-scope for cross-GPU visibility
                 } else {
                     for (int hh = h; hh < H && hh < h + 8; hh++) {
-                        st_na_relaxed_gpu_b16(reinterpret_cast<uint16_t*>(dst + hh),
-                                             *reinterpret_cast<const uint16_t*>(row + hh));
+                        st_relaxed_sys_b16(reinterpret_cast<uint16_t*>(dst + hh),
+                                           *reinterpret_cast<const uint16_t*>(row + hh));
                     }
                 }
             }
@@ -1034,6 +1044,12 @@ __global__ void k_dispatch_2phase_bf16(
             }
         }
     }
+
+    // Ensure all sys-scope writes are visible before kernel completes.
+    // The barrier kernel's fence cannot order writes from this kernel since
+    // they are in different threads' program order. This fence must happen
+    // HERE, in the kernel that did the writes.
+    fence_acq_rel_sys();
 }
 
 // ============================================================================
@@ -2212,15 +2228,15 @@ __global__ void k_return_scatter_bf16(
 
             if (slot_r >= capacity) continue;
 
-            // Write metadata (16B) with non-allocating store for P2P visibility.
+            // Write metadata (16B) - sys-scope for cross-GPU visibility.
             if (lane == 0) {
                 Meta mr{m.row_id, 0, m.gate};
                 int4* meta_dst = reinterpret_cast<int4*>(&meta_buf[slot_r]);
                 int4 meta_val = *reinterpret_cast<const int4*>(&mr);
-                st_na_v4_s32(meta_dst, meta_val);
+                st_relaxed_sys_v4_s32(meta_dst, meta_val);
             }
 
-            // Write BF16 payload using warp-cooperative, non-allocating stores.
+            // Write BF16 payload - sys-scope for cross-GPU visibility.
             const __nv_bfloat16* y_row = Ye + (int64_t)sorted_i * H;
             uint16_t* dst = y_buf + (int64_t)slot_r * Ha;
 
@@ -2229,15 +2245,18 @@ __global__ void k_return_scatter_bf16(
                 if (h + 8 <= H) {
                     int4* d = reinterpret_cast<int4*>(dst + h);
                     int4 v = *reinterpret_cast<const int4*>(y_row + h);
-                    st_na_v4_s32(d, v);
+                    st_relaxed_sys_v4_s32(d, v);
                 } else {
                     for (int hh = h; hh < H && hh < h + 8; hh++) {
-                        st_na_relaxed_gpu_b16(dst + hh, reinterpret_cast<const uint16_t*>(y_row)[hh]);
+                        st_relaxed_sys_b16(dst + hh, reinterpret_cast<const uint16_t*>(y_row)[hh]);
                     }
                 }
             }
         }
     }
+
+    // Fence to ensure all sys-scope writes are visible before kernel completes
+    fence_acq_rel_sys();
 }
 
 // Blockscaled return scatter kernel (uses d_buffer_ptrs_block)
@@ -2419,19 +2438,22 @@ __global__ void k_return_write_tokslot_bf16(
         uint16_t* tok_y = reinterpret_cast<uint16_t*>(dst_buf + tok_y_off);
         float* tok_gate = reinterpret_cast<float*>(dst_buf + tok_gate_off);
 
-        // Gate is a scalar; one lane writes.
-        if (lane == 0) st_na_f32(tok_gate + idx, m.gate);
+        // Gate is a scalar; one lane writes. Use sys-scope for cross-GPU visibility.
+        if (lane == 0) st_relaxed_sys_s32(reinterpret_cast<int*>(tok_gate + idx), __float_as_int(m.gate));
 
         const uint16_t* src_u16 = reinterpret_cast<const uint16_t*>(Ye_sorted + (int64_t)sorted_i * H);
         uint16_t* dst_u16 = tok_y + idx * Ha;
 
-        // H is required to be multiple of 8 (int4 = 8 BF16).
+        // H is required to be multiple of 8 (int4 = 8 BF16). Sys-scope for cross-GPU.
         for (int h = lane * 8; h < H; h += 32 * 8) {
             int4 v = *reinterpret_cast<const int4*>(src_u16 + h);
             int4* d = reinterpret_cast<int4*>(dst_u16 + h);
-            st_na_v4_s32(d, v);
+            st_relaxed_sys_v4_s32(d, v);
         }
     }
+
+    // Fence to ensure all sys-scope writes are visible before kernel completes
+    fence_acq_rel_sys();
 }
 
 __global__ void k_return_write_tokslot_blockscaled(
@@ -2479,17 +2501,22 @@ __global__ void k_return_write_tokslot_blockscaled(
         uint16_t* tok_y = reinterpret_cast<uint16_t*>(dst_buf + tok_y_off);
         float* tok_gate = reinterpret_cast<float*>(dst_buf + tok_gate_off);
 
-        if (lane == 0) st_na_f32(tok_gate + idx, m.gate);
+        // Gate is a scalar; one lane writes. Use sys-scope for cross-GPU visibility.
+        if (lane == 0) st_relaxed_sys_s32(reinterpret_cast<int*>(tok_gate + idx), __float_as_int(m.gate));
 
         const uint16_t* src_u16 = reinterpret_cast<const uint16_t*>(Ye_sorted + (int64_t)sorted_i * H);
         uint16_t* dst_u16 = tok_y + idx * Ha;
 
+        // Sys-scope for cross-GPU visibility.
         for (int h = lane * 8; h < H; h += 32 * 8) {
             int4 v = *reinterpret_cast<const int4*>(src_u16 + h);
             int4* d = reinterpret_cast<int4*>(dst_u16 + h);
-            st_na_v4_s32(d, v);
+            st_relaxed_sys_v4_s32(d, v);
         }
     }
+
+    // Fence to ensure all sys-scope writes are visible before kernel completes
+    fence_acq_rel_sys();
 }
 
 __global__ void k_reduce_tokslot_gate_bf16(
@@ -2570,12 +2597,15 @@ __global__ void k_send_dx_tokslot_bf16(
         const uint16_t* src_u16 = reinterpret_cast<const uint16_t*>(dXe_sorted + (int64_t)i * H);
         uint16_t* dst_u16 = tok_y + idx * Ha;
 
+        // Sys-scope for cross-GPU visibility
         for (int h = lane * 8; h < H; h += 32 * 8) {
             int4 v = *reinterpret_cast<const int4*>(src_u16 + h);
             int4* d = reinterpret_cast<int4*>(dst_u16 + h);
-            st_na_v4_s32(d, v);
+            st_relaxed_sys_v4_s32(d, v);
         }
     }
+
+    fence_acq_rel_sys();
 }
 
 __global__ void k_send_dx_tokslot_blockscaled(
@@ -2610,12 +2640,15 @@ __global__ void k_send_dx_tokslot_blockscaled(
         const uint16_t* src_u16 = reinterpret_cast<const uint16_t*>(dXe_sorted + (int64_t)i * H);
         uint16_t* dst_u16 = tok_y + idx * Ha;
 
+        // Sys-scope for cross-GPU visibility
         for (int h = lane * 8; h < H; h += 32 * 8) {
             int4 v = *reinterpret_cast<const int4*>(src_u16 + h);
             int4* d = reinterpret_cast<int4*>(dst_u16 + h);
-            st_na_v4_s32(d, v);
+            st_relaxed_sys_v4_s32(d, v);
         }
     }
+
+    fence_acq_rel_sys();
 }
 
 __global__ void k_reduce_tokslot_sum_bf16(
@@ -3057,6 +3090,12 @@ __global__ void k_ipc_barrier_phase_bf16(int phase) {
     int world = d_world_bf16;
     int my_rank = d_my_rank_bf16;
 
+    // Fence to ensure all prior writes (from previous kernels) are sys-visible
+    // before we signal completion. Without this, the release store only orders
+    // writes within THIS kernel, not writes from previous dispatch kernels.
+    fence_acq_rel_sys();
+    __syncthreads();
+
     if (tid < world) {
         int* peer_sig = d_barrier_signal_ptrs_bf16[tid] + my_rank;
         st_release_sys_s32(peer_sig, phase);
@@ -3081,6 +3120,10 @@ __global__ void k_ipc_barrier_phase_block(int phase) {
     int tid = threadIdx.x;
     int world = d_world_block;
     int my_rank = d_my_rank_block;
+
+    // Fence to ensure all prior writes (from previous kernels) are sys-visible
+    fence_acq_rel_sys();
+    __syncthreads();
 
     if (tid < world) {
         int* peer_sig = d_barrier_signal_ptrs_block[tid] + my_rank;
@@ -3162,7 +3205,7 @@ __global__ void k_push_stage_dy_ipc_bf16(
                 int4 v = *reinterpret_cast<const int4*>(row + h);
                 int4* d = reinterpret_cast<int4*>(dst + h);
                 if (is_remote) {
-                    st_na_v4_s32(d, v);
+                    st_relaxed_sys_v4_s32(d, v);  // sys-scope for cross-GPU
                 } else {
                     *d = v;
                 }
@@ -3170,7 +3213,7 @@ __global__ void k_push_stage_dy_ipc_bf16(
                 for (int hh = h; hh < H && hh < h + 8; hh++) {
                     const uint16_t u = reinterpret_cast<const uint16_t*>(row)[hh];
                     if (is_remote) {
-                        st_na_relaxed_gpu_b16(dst + hh, u);
+                        st_relaxed_sys_b16(dst + hh, u);  // sys-scope for cross-GPU
                     } else {
                         dst[hh] = u;
                     }
@@ -3178,6 +3221,8 @@ __global__ void k_push_stage_dy_ipc_bf16(
             }
         }
     }
+
+    fence_acq_rel_sys();
 }
 
 __global__ void k_push_stage_dy_ipc_blockscaled(
@@ -3214,7 +3259,7 @@ __global__ void k_push_stage_dy_ipc_blockscaled(
                 int4 v = *reinterpret_cast<const int4*>(row + h);
                 int4* d = reinterpret_cast<int4*>(dst + h);
                 if (is_remote) {
-                    st_na_v4_s32(d, v);
+                    st_relaxed_sys_v4_s32(d, v);  // sys-scope for cross-GPU
                 } else {
                     *d = v;
                 }
@@ -3222,7 +3267,7 @@ __global__ void k_push_stage_dy_ipc_blockscaled(
                 for (int hh = h; hh < H && hh < h + 8; hh++) {
                     const uint16_t u = reinterpret_cast<const uint16_t*>(row)[hh];
                     if (is_remote) {
-                        st_na_relaxed_gpu_b16(dst + hh, u);
+                        st_relaxed_sys_b16(dst + hh, u);  // sys-scope for cross-GPU
                     } else {
                         dst[hh] = u;
                     }
@@ -3230,6 +3275,8 @@ __global__ void k_push_stage_dy_ipc_blockscaled(
             }
         }
     }
+
+    fence_acq_rel_sys();
 }
 
 __global__ void k_gather_dy_from_stage_and_send_gate_ipc_bf16(
@@ -3300,10 +3347,13 @@ __global__ void k_gather_dy_from_stage_and_send_gate_ipc_bf16(
             if (src_rank == my_rank) {
                 tok_gate[idx] = dot;
             } else {
-                st_na_f32(tok_gate + idx, dot);
+                // Sys-scope for cross-GPU visibility
+                st_relaxed_sys_s32(reinterpret_cast<int*>(tok_gate + idx), __float_as_int(dot));
             }
         }
     }
+
+    fence_acq_rel_sys();
 }
 
 __global__ void k_gather_dy_from_stage_and_send_gate_ipc_blockscaled(
@@ -3384,10 +3434,13 @@ __global__ void k_gather_dy_from_stage_and_send_gate_ipc_blockscaled(
             if (src_rank == my_rank) {
                 tok_gate[idx] = dot;
             } else {
-                st_na_f32(tok_gate + idx, dot);
+                // Sys-scope for cross-GPU visibility
+                st_relaxed_sys_s32(reinterpret_cast<int*>(tok_gate + idx), __float_as_int(dot));
             }
         }
     }
+
+    fence_acq_rel_sys();
 }
 
 __global__ void k_collect_tok_gate_ipc(

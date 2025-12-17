@@ -396,6 +396,14 @@ class _MoEBf16Fused(torch.autograd.Function):
 
         T, H = x.shape
         K = int(eid.shape[1])
+        is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        if is_dist:
+            need = int(T) * int(K) * int(rdep.world)
+            if rdep.capacity < need:
+                raise RuntimeError(
+                    f"[RDEP] capacity too small: capacity={rdep.capacity:,} need>={need:,} (T={T:,} K={K} world={rdep.world}). "
+                    "Set capacity to worst-case T*K*world (no silent truncation)."
+                )
 
         offs_pad = torch.empty(rdep.n_local, device=device, dtype=torch.int32)
         # dispatch_meta_bf16 uses this host int32 (pinned) as scratch to read back M_recv.
@@ -414,6 +422,17 @@ class _MoEBf16Fused(torch.autograd.Function):
 
         out_f32 = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
         if M_recv <= 0:
+            # DeepEP collectiveness: every rank must participate in return_scatter even if it sends nothing,
+            # because other ranks may be returning outputs for *our* local tokens, and IPC barriers must match.
+            if is_dist:
+                dummy_ye = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
+                _C.return_scatter(
+                    dummy_ye.data_ptr(),
+                    out_f32.data_ptr(),
+                    0, int(T), int(K),
+                    stream,
+                )
+            ctx.rdep = rdep
             ctx.save_for_backward(x, eid, gates, W1, W3, W2)
             return out_f32.to(dtype=torch.bfloat16)
 
@@ -444,12 +463,14 @@ class _MoEBf16Fused(torch.autograd.Function):
                 stream,
             )
 
+        ctx.rdep = rdep
         ctx.save_for_backward(x, eid, gates, W1, W3, W2)
         return out_f32.to(dtype=torch.bfloat16)
 
     @staticmethod
     def backward(ctx, dOut: torch.Tensor):
         x, eid, gates, W1, W3, W2 = ctx.saved_tensors
+        rdep: Rdep = ctx.rdep
         device = x.device
         stream = torch.cuda.current_stream(device)
 
@@ -461,6 +482,14 @@ class _MoEBf16Fused(torch.autograd.Function):
 
         T, H = x.shape
         K = int(eid.shape[1])
+        is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        if is_dist:
+            need = int(T) * int(K) * int(dist.get_world_size())
+            if rdep.capacity < need:
+                raise RuntimeError(
+                    f"[RDEP] capacity too small: capacity={rdep.capacity:,} need>={need:,} (T={T:,} K={K} world={dist.get_world_size()}). "
+                    "Set capacity to worst-case T*K*world (no silent truncation)."
+                )
 
         offs_pad = torch.empty(int(W1.size(0)), device=device, dtype=torch.int32)
         M_host = torch.zeros(1, device='cpu', dtype=torch.int32).pin_memory()
@@ -477,12 +506,46 @@ class _MoEBf16Fused(torch.autograd.Function):
             )
 
         if M_recv <= 0:
-            dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
-            dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
             dW1 = torch.zeros_like(W1)
             dW3 = torch.zeros_like(W3)
             dW2 = torch.zeros_like(W2)
+            dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
+
+            # DeepEP collectiveness: still run distributed gather/scatter so we:
+            # (1) send dY for our local tokens, (2) receive dGate/dX from other ranks.
+            if is_dist:
+                dGates_tk_f32 = torch.zeros(int(T), int(K), device=device, dtype=torch.float32)
+                dummy_row_id = torch.empty(1, device=device, dtype=torch.int64)
+                dummy_gate_sorted = torch.empty(1, device=device, dtype=torch.float32)
+                dummy_ye_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
+                dummy_dye_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
+                dummy_dgate_sorted = torch.empty(1, device=device, dtype=torch.float32)
+                _C.gather_dy_dist_bf16(
+                    dOut.data_ptr(),
+                    eid.data_ptr(),
+                    dummy_ye_sorted.data_ptr(),
+                    dummy_row_id.data_ptr(),
+                    dummy_gate_sorted.data_ptr(),
+                    dummy_dye_sorted.data_ptr(),
+                    dummy_dgate_sorted.data_ptr(),
+                    dGates_tk_f32.data_ptr(),
+                    0, int(T), int(H), int(K),
+                    stream,
+                )
+                dummy_dxe_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
+                _C.scatter_dx_dist_bf16(
+                    dummy_dxe_sorted.data_ptr(),
+                    dummy_row_id.data_ptr(),
+                    dX.data_ptr(),
+                    0, int(T), int(H), int(K),
+                    stream,
+                )
+                dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
+            else:
+                dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
+
             return None, dX, None, dGates, dW1, dW3, dW2
+
         max_pad = (int(M_recv) + int(offs_pad.numel()) * (align - 1) + (align - 1)) // align * align
         offs_pad[-1] = int(max_pad)
 
@@ -593,6 +656,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         T, H = x.shape
         K = int(eid.shape[1])
         E = int(rdep.n_local)
+        is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        if is_dist:
+            need = int(T) * int(K) * int(rdep.world)
+            if rdep.capacity < need:
+                raise RuntimeError(
+                    f"[RDEP] capacity too small: capacity={rdep.capacity:,} need>={need:,} (T={T:,} K={K} world={rdep.world}). "
+                    "Set capacity to worst-case T*K*world (no silent truncation)."
+                )
 
         # Option A: Use BF16 dispatch + local quantization
         # This ensures Xe_pad (BF16) is available for backward STE
@@ -610,6 +681,10 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
         out_f32 = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
         if M_recv <= 0:
+            # DeepEP collectiveness: every rank must participate in return_scatter
+            if is_dist:
+                dummy_ye = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
+                _C.return_scatter(dummy_ye.data_ptr(), out_f32.data_ptr(), 0, int(T), int(K), stream)
             ctx.rdep = rdep
             ctx.W_cache = W_cache
             ctx.T = int(T)
@@ -707,6 +782,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         H = int(ctx.H)
         K = int(ctx.K)
         E = int(rdep.n_local)
+        is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        if is_dist:
+            need = int(T) * int(K) * int(dist.get_world_size())
+            if rdep.capacity < need:
+                raise RuntimeError(
+                    f"[RDEP] capacity too small: capacity={rdep.capacity:,} need>={need:,} (T={T:,} K={K} world={dist.get_world_size()}). "
+                    "Set capacity to worst-case T*K*world (no silent truncation)."
+                )
 
         # Option A: Use BF16 dispatch to get correct Xe_pad from all ranks
         # This fixes the distributed bug where local x was used for remote rows
@@ -723,11 +806,43 @@ class _MoEBlockscaledFused(torch.autograd.Function):
             )
 
         if M_recv <= 0:
-            dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
-            dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
             dW1 = torch.zeros_like(W1)
             dW3 = torch.zeros_like(W3)
             dW2 = torch.zeros_like(W2)
+            dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
+
+            # DeepEP collectiveness: still run distributed gather/scatter
+            if is_dist:
+                dGates_tk_f32 = torch.zeros(int(T), int(K), device=device, dtype=torch.float32)
+                dummy_row_id = torch.empty(1, device=device, dtype=torch.int64)
+                dummy_gate_sorted = torch.empty(1, device=device, dtype=torch.float32)
+                dummy_ye_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
+                dummy_dye_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
+                dummy_dgate_sorted = torch.empty(1, device=device, dtype=torch.float32)
+                _C.gather_dy_dist_bf16(
+                    dOut.data_ptr(),
+                    eid.data_ptr(),
+                    dummy_ye_sorted.data_ptr(),
+                    dummy_row_id.data_ptr(),
+                    dummy_gate_sorted.data_ptr(),
+                    dummy_dye_sorted.data_ptr(),
+                    dummy_dgate_sorted.data_ptr(),
+                    dGates_tk_f32.data_ptr(),
+                    0, int(T), int(H), int(K),
+                    stream,
+                )
+                dummy_dxe_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
+                _C.scatter_dx_dist_bf16(
+                    dummy_dxe_sorted.data_ptr(),
+                    dummy_row_id.data_ptr(),
+                    dX.data_ptr(),
+                    0, int(T), int(H), int(K),
+                    stream,
+                )
+                dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
+            else:
+                dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
+
             return None, dX, None, dGates, dW1, dW3, dW2, None
 
         # Compute max_pad and extend last expert's padded region
@@ -791,7 +906,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         # TODO(perf): The gather_dy kernels still compute dGate internally (dot product of Ye*dOut).
         # This is wasted compute (~negligible). To fully remove, modify CUDA kernels in rdep.cu.
         dYe_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
-        dGate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)  # unused, but kernel writes to it
+        dGate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
+        dGates_tk_f32 = torch.zeros(int(T), int(K), device=device, dtype=torch.float32)
 
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             _C.gather_dy_dist_bf16(
@@ -802,7 +918,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
                 gate_sorted.data_ptr(),
                 dYe_sorted.data_ptr(),
                 dGate_sorted.data_ptr(),
-                torch.empty(0, device=device).data_ptr(),  # dGates_tk unused
+                dGates_tk_f32.data_ptr(),
                 int(M_recv), int(T), int(H), int(K),
                 stream,
             )
@@ -813,8 +929,15 @@ class _MoEBlockscaledFused(torch.autograd.Function):
                 row_id.data_ptr(),
                 gate_sorted.data_ptr(),
                 dYe_sorted.data_ptr(),
-                dGate_sorted.data_ptr(),  # computed but discarded
+                dGate_sorted.data_ptr(),
                 int(M_recv), int(T), int(H), int(K),
+                stream,
+            )
+            _C.scatter_gate_bf16(
+                dGate_sorted.data_ptr(),
+                row_id.data_ptr(),
+                dGates_tk_f32.data_ptr(),
+                int(M_recv), int(T), int(K),
                 stream,
             )
 
@@ -902,7 +1025,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
                 stream,
             )
 
-        dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
+        dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
         return None, dX, None, dGates, dW1, dW3, dW2, None
 
 

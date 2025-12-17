@@ -42,6 +42,23 @@ RUN git clone https://github.com/triton-lang/triton.git triton && \
     cd triton && git checkout bad25767a03107bc23e066d94aca489dc86ca70c && \
     cd .. && uv pip install -e ./triton
 
+# Clone FlashAttention (pinned) and keep only the CuTe implementation (FA4).
+# We vendor CuTe sources into /workspace/nmoe/third_party/flash_attn/cute.
+RUN mkdir -p third_party/flash_attn_upstream && \
+    cd third_party/flash_attn_upstream && \
+    git init && \
+    git remote add origin https://github.com/Dao-AILab/flash-attention.git && \
+    git sparse-checkout init --cone && \
+    git sparse-checkout set flash_attn/cute && \
+    git fetch --depth 1 origin ac9b5f107f2f19cd0ca6e01548d20d072a46335c && \
+    git checkout --detach FETCH_HEAD && \
+    cd /workspace/nmoe && \
+    rm -rf third_party/flash_attn/cute && \
+    mkdir -p third_party/flash_attn && \
+    cp -a third_party/flash_attn_upstream/flash_attn/cute third_party/flash_attn/cute && \
+    rm -rf third_party/flash_attn_upstream && \
+    echo "✓ Vendored FlashAttention CuTe (FA4, pinned)"
+
 # Clone FlashMLA (pinned) and its CUTLASS submodule.
 # We keep only the SM100 dense prefill backward sources + CUTLASS headers.
 RUN git clone https://github.com/deepseek-ai/FlashMLA.git third_party/flashmla && \

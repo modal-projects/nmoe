@@ -278,6 +278,15 @@ __device__ __forceinline__ void st_relaxed_sys_s32(int* ptr, int val) {
     asm volatile("st.relaxed.sys.global.s32 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
 }
 
+__device__ __forceinline__ void st_relaxed_sys_b16(uint16_t* ptr, uint16_t val) {
+    asm volatile("st.relaxed.sys.global.b16 [%0], %1;" :: "l"(ptr), "h"(val) : "memory");
+}
+
+__device__ __forceinline__ void st_relaxed_sys_v4_s32(int4* ptr, int4 val) {
+    asm volatile("st.relaxed.sys.global.v4.s32 [%0], {%1, %2, %3, %4};"
+                 :: "l"(ptr), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w) : "memory");
+}
+
 // --- System-scope loads (for reading P2P data from other GPUs) ---
 __device__ __forceinline__ int ld_acquire_sys_s32(const int* ptr) {
     int ret;

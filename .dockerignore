@@ -1,6 +1,9 @@
 # Exclude NVSHMEM submodule working tree (will be cloned fresh in Docker)
 third_party/nvshmem/
 
+# Exclude vendored FlashAttention CuTe sources (vendored in Dockerfile.base).
+third_party/flash_attn/cute/
+
 # Exclude git metadata (not needed in container)
 .git/
 .gitmodules
