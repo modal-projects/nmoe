@@ -31,6 +31,9 @@ template:
         imagePullPolicy: Always
         workingDir: /workspace/nmoe
         env:
+          # GitHub Actions runner requires this when running as root
+          - name: RUNNER_ALLOW_RUNASROOT
+            value: "1"
           # Paths
           - name: NMOE_DATA_PATH
             value: "/data"
