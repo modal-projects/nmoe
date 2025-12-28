@@ -33,7 +33,7 @@ on:
 
 jobs:
   tier-b:
-    runs-on: [self-hosted, b200]
+    runs-on: b200
     environment: b200
     permissions:
       contents: read
