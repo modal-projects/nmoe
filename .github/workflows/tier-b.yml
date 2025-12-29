@@ -44,10 +44,10 @@ jobs:
         with:
           ref: refs/pull/${{ inputs.pr_number }}/merge
           fetch-depth: 0
-          path: checkout
+          path: /tmp/pr
 
       - name: Build CUDA extension (PR merge ref)
-        working-directory: checkout
+        working-directory: /tmp/pr
         run: |
           set -euo pipefail
           . /workspace/nmoe/.venv/bin/activate
@@ -55,7 +55,7 @@ jobs:
 
       - name: Run gates
         id: run
-        working-directory: checkout
+        working-directory: /tmp/pr
         env:
           BUNDLE: ${{ inputs.bundle }}
           SINGLE_GATE: ${{ inputs.single_gate }}
@@ -294,7 +294,7 @@ jobs:
 
       - name: Job summary
         if: always()
-        working-directory: checkout
+        working-directory: /tmp/pr
         run: |
           set -euo pipefail
           . /workspace/nmoe/.venv/bin/activate
@@ -328,7 +328,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const resultsPath = 'checkout/tier_b_results.json';
+            const resultsPath = '/tmp/pr/tier_b_results.json';
             if (!fs.existsSync(resultsPath)) return;
             const data = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
             const gateIds = data.gate_ids || [];
