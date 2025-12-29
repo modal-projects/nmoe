@@ -29,7 +29,7 @@ template:
       - name: runner
         image: ghcr.io/noumena-network/nmoe:runner-latest
         imagePullPolicy: Always
-        workingDir: /workspace/nmoe
+        # Note: Don't set workingDir - let GitHub Actions manage workspace
         env:
           # GitHub Actions runner requires this when running as root
           - name: RUNNER_ALLOW_RUNASROOT
