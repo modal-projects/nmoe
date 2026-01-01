@@ -356,7 +356,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
     # Expert compute (blockscaled)
     from nmoe.blockscaled.grouped import expert_blockscaled
-    Ye_pad = expert_blockscaled(Xe_q, Xe_sf, W_cache, offs_pad)
+    Ye_pad = expert_blockscaled(Xe_q, Xe_sf, W_cache, offs_pad, capacity_rows=int(rdep.capacity))
 
     _C.return_scatter_from_pad_blockscaled(
       Ye_pad.data_ptr(),
@@ -467,17 +467,17 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     gate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
     _C.gather_meta_sorted_bf16(row_id.data_ptr(), gate_sorted.data_ptr(), int(M_recv), stream)
 
-    # SonicMoE optimization: compute dGate via ⟨A, dA'⟩ instead of ⟨dOut, Ye⟩
-    # This eliminates the expensive Ye_pad recomputation for dGate.
-    # A = post-SwiGLU activation, dA' = dYe @ W2.T (ungated gradient)
-
+    # SonicMoE optimization: compute dGate via ⟨A, dA'⟩ instead of ⟨dOut, Ye⟩.
+    # This eliminates the expensive Ye_pad recomputation for dGate - we compute
+    # dGate = ⟨A, dA⟩ directly from activations, not ⟨dOut, Ye⟩ from outputs.
+    # A = post-SwiGLU activation, dA = dYe @ W2.T (ungated gradient)
+    #
+    # TODO(perf): The gather_dy kernels still compute dGate internally (dot product of Ye*dOut).
+    # This is wasted compute (~negligible). To fully remove, modify CUDA kernels in rdep.cu.
     dYe_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
     dGate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
     dGates_tk_f32 = torch.zeros(int(T), int(K), device=device, dtype=torch.float32)
 
-    # SonicMoE optimization: compute dGate via ⟨A, dA'⟩ instead of ⟨dOut, Ye⟩
-    # This eliminates the expensive Ye_pad recomputation for dGate in both
-    # single-GPU and distributed modes.
     is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     if is_dist:
       # Distributed path: gather dYe across ranks with gate scaling (no dGate yet)
