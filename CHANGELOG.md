@@ -4,6 +4,18 @@ All notable changes to nmoe are documented here.
 
 ## [Unreleased]
 
+## [2026-01-02] - Issue 08: ZeRO-2 Chunked Reduce-Scatter and Checkpoint Reliability
+
+### Added
+- Chunked reduce-scatter in ZeRO-2 (`nmoe/zero2.py`): configurable via `NMOE_ZERO2_RS_CHUNK_MB` (default 2GB)
+- Third-party import path setup in `nmoe/runtime.py`
+
+### Changed
+- `nmoe/checkpoint.py`: eager CPU copy before background queue; clean thread shutdown
+- `nmoe/train.py`: support `--resume` / `--no-resume` boolean flags
+- `nmoe/opt.py`: return dense LR for logging (multi-group compatibility)
+- `nmoe/quant.py`: direct csrc import to avoid circular dependencies
+
 ## [2026-01-01] - Issue 09: Blockscaled Expert OOM Fix
 
 ### Added

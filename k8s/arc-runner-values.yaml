@@ -29,7 +29,7 @@ template:
 
     containers:
       - name: runner
-        image: ghcr.io/noumena-network/nmoe:runner-latest
+        image: xjdr/nmoe:runner
         imagePullPolicy: Always
         # Note: Don't set workingDir - let GitHub Actions manage workspace
         env:

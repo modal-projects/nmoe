@@ -2,11 +2,11 @@
 # Based on nmoe_train for full training capability
 #
 # Build:
-#   docker build -f docker/Dockerfile.runner -t ghcr.io/noumena-network/nmoe:runner-$(git rev-parse --short HEAD) .
+#   make -C docker runner
 #
 # The runner will be used by ARC (Actions Runner Controller) on B200 nodes.
 
-ARG BASE_IMAGE=ghcr.io/noumena-network/nmoe:train-latest
+ARG BASE_IMAGE=xjdr/nmoe_train:latest
 FROM ${BASE_IMAGE}
 
 ARG RUNNER_VERSION=2.330.0
