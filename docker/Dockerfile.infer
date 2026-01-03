@@ -1,83 +1,31 @@
-# Standalone inference image with CUDA 12.9 (required for FlashMLA SM100 sparse kernels)
-FROM nvidia/cuda:12.9.0-cudnn-devel-ubuntu24.04
+# Inference image - extends deps with DeepEP, DeepGEMM, full FlashMLA, nixl
+FROM xjdr/nmoe:deps
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV CUDA_HOME=/usr/local/cuda
-ENV PATH=${CUDA_HOME}/bin:${PATH}
-ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
-ENV TORCH_CUDA_ARCH_LIST="10.0a"
-ENV CUTLASS_NVCC_ARCHS="100a"
-ENV UV_HTTP_TIMEOUT=900 UV_HTTP_RETRIES=5 UV_CONCURRENT_DOWNLOADS=1 UV_CONCURRENT_INSTALLS=1
-
-# NCCL settings
-ENV NCCL_DEBUG=WARN
-ENV NCCL_IB_DISABLE=1
-ENV NCCL_P2P_DISABLE=0
-ENV NCCL_P2P_LEVEL=NVL
-ENV NCCL_SHM_DISABLE=0
-ENV CUDA_DEVICE_MAX_CONNECTIONS=1
-
-# Install system dependencies
+# Additional system deps for RDMA/inference
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    cmake \
-    git \
-    curl \
-    wget \
-    ninja-build \
-    zlib1g-dev \
-    libxml2-dev \
-    python3.12-dev \
     libibverbs-dev \
     librdmacm-dev \
     libnuma-dev \
-    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv for fast Python package management
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+# Additional Python deps for inference
+RUN uv pip install safetensors packaging "nixl[cu12]"
 
-# Set working directory
-WORKDIR /workspace/nmoe
-
-# Create virtual environment with Python 3.12 explicitly
-RUN uv venv --python python3.12
-
-# Install PyTorch nightly with CUDA 12.9
-RUN uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu129
-RUN uv pip install tiktoken pybind11 openai_harmony numpy nvidia-cutlass-dsl==4.3.4 cuda-python==12.9.0 duckdb safetensors packaging apache-tvm-ffi
-
-# Clone and build Triton from source (pinned commit)
-RUN git clone https://github.com/triton-lang/triton.git triton && \
-    cd triton && git checkout bad25767a03107bc23e066d94aca489dc86ca70c && \
-    cd .. && uv pip install -e ./triton
-
-# Clone FlashAttention (pinned) and keep only the CuTe implementation (FA4).
-RUN mkdir -p third_party/flash_attn_upstream && \
-    cd third_party/flash_attn_upstream && \
-    git init && \
-    git remote add origin https://github.com/Dao-AILab/flash-attention.git && \
-    git sparse-checkout init --cone && \
-    git sparse-checkout set flash_attn/cute && \
-    git fetch --depth 1 origin ac9b5f107f2f19cd0ca6e01548d20d072a46335c && \
-    git checkout --detach FETCH_HEAD && \
-    cd /workspace/nmoe && \
-    rm -rf third_party/flash_attn/cute && \
-    mkdir -p third_party/flash_attn && \
-    cp -a third_party/flash_attn_upstream/flash_attn/cute third_party/flash_attn/cute && \
-    rm -rf third_party/flash_attn_upstream && \
-    echo "✓ Vendored FlashAttention CuTe (FA4, pinned)"
-
-# Clone FlashMLA (pinned) and its CUTLASS submodule
-RUN git clone https://github.com/deepseek-ai/FlashMLA.git third_party/flashmla && \
+# Replace pruned FlashMLA with full version (inference needs sparse kernels)
+RUN rm -rf third_party/flashmla && \
+    git clone https://github.com/deepseek-ai/FlashMLA.git third_party/flashmla && \
     cd third_party/flashmla && \
     git checkout 1408756a88e52a25196b759eaf8db89d2b51b5a1 && \
     git submodule update --init --recursive && \
     rm -rf .git && \
     find . -name .git -o -name .gitmodules -exec rm -rf {} + && \
-    echo "✓ Cloned FlashMLA"
+    echo "✓ Cloned FlashMLA (full)"
+
+# Build FlashMLA (SM100 sparse kernels)
+RUN cd third_party/flashmla && \
+    FLASH_MLA_DISABLE_SM90=1 \
+    /workspace/nmoe/.venv/bin/python setup.py build_ext --inplace && \
+    echo "✓ Built FlashMLA"
 
 # Clone and build DeepEP (intranode only, no NVSHMEM)
 RUN git clone https://github.com/deepseek-ai/DeepEP.git third_party/DeepEP && \
@@ -85,9 +33,6 @@ RUN git clone https://github.com/deepseek-ai/DeepEP.git third_party/DeepEP && \
     git submodule update --init --recursive && \
     rm -rf .git && \
     find . -name .git -o -name .gitmodules -exec rm -rf {} + && \
-    echo "✓ Cloned DeepEP"
-
-RUN cd third_party/DeepEP && \
     /workspace/nmoe/.venv/bin/python setup.py build_ext --inplace && \
     echo "✓ Built DeepEP"
 
@@ -97,26 +42,22 @@ RUN git clone https://github.com/deepseek-ai/DeepGEMM.git third_party/DeepGEMM &
     git submodule update --init --recursive && \
     rm -rf .git && \
     find . -name .git -o -name .gitmodules -exec rm -rf {} + && \
-    echo "✓ Cloned DeepGEMM"
-
-RUN cd third_party/DeepGEMM && \
     /workspace/nmoe/.venv/bin/python setup.py build_ext --inplace && \
     echo "✓ Built DeepGEMM"
 
-# Build FlashMLA (SM100 sparse kernels require NVCC 12.9)
-RUN cd third_party/flashmla && \
-    FLASH_MLA_DISABLE_SM90=1 \
-    /workspace/nmoe/.venv/bin/python setup.py build_ext --inplace && \
-    echo "✓ Built FlashMLA"
-
-RUN uv pip install "nixl[cu12]"
+# NCCL settings
+ENV NCCL_DEBUG=WARN
+ENV NCCL_IB_DISABLE=1
+ENV NCCL_P2P_DISABLE=0
+ENV NCCL_P2P_LEVEL=NVL
+ENV NCCL_SHM_DISABLE=0
+ENV CUDA_DEVICE_MAX_CONNECTIONS=1
 
 # Copy source
 COPY . /workspace/nmoe
 
-# Build nmoe kernels (use venv python)
-RUN PATH="/workspace/nmoe/.venv/bin:$PATH" make -C nmoe/csrc
+# Build nmoe kernels
+RUN . .venv/bin/activate && make -C nmoe/csrc
 
-# Python path
-ENV PATH="/workspace/nmoe/.venv/bin:${PATH}"
-ENV PYTHONPATH=/workspace/nmoe:/workspace/nmoe/third_party/flash_attn:/workspace/nmoe/third_party/DeepEP:/workspace/nmoe/third_party/DeepGEMM:/workspace/nmoe/third_party/flashmla
+# Python path (add inference deps)
+ENV PYTHONPATH=/workspace/nmoe:/workspace/nmoe/nmoe/csrc:/workspace/nmoe/third_party/flash_attn:/workspace/nmoe/third_party/DeepEP:/workspace/nmoe/third_party/DeepGEMM:/workspace/nmoe/third_party/flashmla:/workspace/nmoe/triton/python
