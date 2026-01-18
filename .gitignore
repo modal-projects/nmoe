@@ -85,3 +85,4 @@ nmoe/serve/kernels/*sglang*.cu
 # OS junk
 .DS_Store
 Thumbs.db
+.tmp/

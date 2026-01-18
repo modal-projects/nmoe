@@ -1,0 +1,100 @@
+# Speedrun: Small Sparse MoE - RL (GRPO) sanity test
+#
+# Based on small_moe.toml, uses pretrained checkpoint for RL fine-tuning.
+# Tests end-to-end GRPO training with GSM8K + HumanEval rewards.
+#
+# Run:
+#   torchrun --nproc_per_node=8 -m nmoe.rl.train configs/speedrun/small_moe_rl.toml
+
+preset = "speedrun_small_moe_rl"
+experiment_id = "speedrun_small_moe_rl_sanity"
+
+# Benchmark token stream (GPT-2, padded to 128 for vectorization)
+tokenizer = "gpt2"
+vocab_size = 50304  # 50257 padded to next multiple of 128
+eos_token_id = 50256
+loss_mask_eos = false
+
+# Checkpoint (pretrained speedrun model)
+checkpoint_dir = "/data/checkpoints"
+resume = true
+
+# =============================================================================
+# Model Architecture (must match pretrained checkpoint)
+# =============================================================================
+dim = 768
+n_layers = 12
+n_heads = 12
+inter_dim = 3072
+
+# MoE: 64 routed experts, top-6 routed + 2 shared = 8 total/token
+n_dense_layers = 1
+n_routed_experts = 64
+n_shared_experts = 2
+n_activated_experts = 6
+moe_inter_dim = 384
+
+# Attention: SDPA
+attn = "sdpa"
+
+# =============================================================================
+# RL Training
+# =============================================================================
+rl_enabled = true
+rl_algorithm = "grpo"
+
+# Batch: 8 prompts total (1 per GPU), 8 completions per prompt = 64 sequences
+batch_size = 8
+rl_group_size = 8
+
+# GRPO hyperparameters (DeepSeek-R1 / Dr.GRPO defaults)
+rl_clip_eps = 0.2           # Standard PPO clipping
+rl_kl_coef = 0.001          # KL penalty coefficient
+rl_kl_type = "k3"           # DeepSeek-R1 style KL
+rl_normalize_std = false    # Dr.GRPO: no std normalization
+rl_length_norm_constant = true  # Dr.GRPO: constant length normalization
+
+# Rollout settings
+rl_max_new_tokens = 256     # Shorter for speedrun testing
+rl_temperature = 0.7
+rl_top_p = 0.95
+rl_updates_per_batch = 2    # PPO-style multiple updates
+
+# Anti-reward-hacking
+rl_use_opsm = false         # Off for initial testing
+rl_neg_adv_scale = 1.0      # Symmetric for initial testing
+rl_filter_zero_std = true   # Filter uninformative groups
+
+# Training
+steps = 10                  # Short sanity test
+dtype = "bf16"              # Use bf16 for stability in initial test
+seq_len = 512               # Max sequence length
+
+# =============================================================================
+# Optimizer (match speedrun settings)
+# =============================================================================
+use_muon = false
+lr_dense = 1e-5             # Lower LR for fine-tuning
+lr_expert = 1e-5
+lr_router = 1e-5
+weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.95
+adam_eps = 1e-8
+
+# Schedule (no warmup for short test)
+warmup_steps = 0
+hold_tokens = 1000000000    # Hold at peak LR
+decay_tokens = 1
+decay_floor = 1e-6
+
+# =============================================================================
+# Task sources
+# =============================================================================
+eval_tasks_file = "configs/eval/tasks.toml"
+
+# =============================================================================
+# Checkpointing & Logging
+# =============================================================================
+checkpoint_every = 999999999  # Don't checkpoint during sanity test
+log_every = 1

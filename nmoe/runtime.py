@@ -6,8 +6,33 @@ Seamlessly supports single GPU, single-node multi-GPU, and multi-node training.
 import os
 import sys
 from pathlib import Path
+
 import torch
 import torch.distributed as dist
+
+
+def _maybe_add_repo_third_party_to_sys_path(*, repo_root: str | Path | None = None) -> None:
+  """Make vendored deps under repo-root/third_party importable.
+
+  The supported execution path is container-first; these vendored deps are part
+  of the image checkout and should be importable without requiring users to
+  manually extend PYTHONPATH.
+  """
+  root = None
+  if repo_root is not None:
+    root = Path(repo_root)
+  else:
+    try:
+      root = Path(__file__).resolve().parent.parent
+    except Exception:
+      return
+
+  third_party = root / "third_party"
+  if not third_party.is_dir():
+    return
+  p = str(third_party)
+  if p not in sys.path:
+    sys.path.insert(0, p)
 
 
 def _require_b200():
@@ -20,16 +45,6 @@ def _require_b200():
       f"This repo targets NVIDIA B200 (sm_100a). Detected compute capability {major}.{minor}. "
       "Off-target is not supported."
     )
-
-
-def _ensure_third_party_imports() -> None:
-  """Ensure vendored deps are importable (container-first contract)."""
-  root = Path(__file__).resolve().parents[1]
-  flash_attn = root / "third_party" / "flash_attn"
-  if flash_attn.exists():
-    p = str(flash_attn)
-    if p not in sys.path:
-      sys.path.insert(0, p)
 
 
 def init(seed: int = 42) -> tuple[int, int]:
@@ -46,8 +61,8 @@ def init(seed: int = 42) -> tuple[int, int]:
   - Single-node multi-GPU: torchrun sets LOCAL_RANK, init NCCL
   - Multi-node: same as single-node, world > local_world
   """
+  _maybe_add_repo_third_party_to_sys_path()
   _require_b200()
-  _ensure_third_party_imports()
 
   # Seeds and TF32
   torch.backends.cuda.matmul.allow_tf32 = True

@@ -1,0 +1,298 @@
+diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
+index 8a996955e..8a94e76f3 100644
+--- a/codex-rs/Cargo.toml
++++ b/codex-rs/Cargo.toml
+@@ -47,6 +47,7 @@ members = [
+     "utils/string",
+     "codex-client",
+     "codex-api",
++    "python-bindings",
+ ]
+ resolver = "2"
+ 
+diff --git a/codex-rs/python-bindings/Cargo.toml b/codex-rs/python-bindings/Cargo.toml
+new file mode 100644
+index 000000000..e8bef5f00
+--- /dev/null
++++ b/codex-rs/python-bindings/Cargo.toml
+@@ -0,0 +1,21 @@
++[package]
++name = "codex-python"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++description = "Python bindings for codex-rs sandboxed execution"
++
++[lib]
++name = "codex_python"
++crate-type = ["cdylib"]
++
++[dependencies]
++pyo3 = { version = "0.23", features = ["extension-module"] }
++tokio = { workspace = true, features = ["full"] }
++serde = { workspace = true }
++serde_json = { workspace = true }
++thiserror = { workspace = true }
++
++# Local codex dependencies
++codex-core = { workspace = true }
++codex-protocol = { workspace = true }
+diff --git a/codex-rs/python-bindings/pyproject.toml b/codex-rs/python-bindings/pyproject.toml
+new file mode 100644
+index 000000000..02ef30af4
+--- /dev/null
++++ b/codex-rs/python-bindings/pyproject.toml
+@@ -0,0 +1,16 @@
++[build-system]
++requires = ["maturin>=1.0,<2.0"]
++build-backend = "maturin"
++
++[project]
++name = "codex-python"
++requires-python = ">=3.10"
++classifiers = [
++    "Programming Language :: Rust",
++    "Programming Language :: Python :: Implementation :: CPython",
++]
++dynamic = ["version"]
++
++[tool.maturin]
++features = ["pyo3/extension-module"]
++module-name = "codex_python"
+diff --git a/codex-rs/python-bindings/src/lib.rs b/codex-rs/python-bindings/src/lib.rs
+new file mode 100644
+index 000000000..08b9f20d8
+--- /dev/null
++++ b/codex-rs/python-bindings/src/lib.rs
+@@ -0,0 +1,231 @@
++//! Python bindings for codex-rs sandboxed execution.
++//!
++//! Provides a Python interface to execute code in a sandboxed environment
++//! using codex-rs infrastructure.
++
++use pyo3::prelude::*;
++use pyo3::exceptions::{PyRuntimeError, PyTimeoutError};
++use std::collections::HashMap;
++use std::time::Duration;
++
++/// Result of executing a command in the sandbox.
++#[pyclass]
++#[derive(Clone)]
++pub struct ExecResult {
++    #[pyo3(get)]
++    pub success: bool,
++    #[pyo3(get)]
++    pub exit_code: i32,
++    #[pyo3(get)]
++    pub stdout: String,
++    #[pyo3(get)]
++    pub stderr: String,
++    #[pyo3(get)]
++    pub duration_ms: u64,
++}
++
++#[pymethods]
++impl ExecResult {
++    fn __repr__(&self) -> String {
++        format!(
++            "ExecResult(success={}, exit_code={}, stdout_len={}, stderr_len={})",
++            self.success, self.exit_code, self.stdout.len(), self.stderr.len()
++        )
++    }
++}
++
++/// Configuration for the sandbox executor.
++#[pyclass]
++#[derive(Clone)]
++pub struct SandboxConfig {
++    #[pyo3(get, set)]
++    pub timeout_ms: u64,
++    #[pyo3(get, set)]
++    pub working_dir: Option<String>,
++    #[pyo3(get, set)]
++    pub allow_network: bool,
++    #[pyo3(get, set)]
++    pub read_only_paths: Vec<String>,
++    #[pyo3(get, set)]
++    pub read_write_paths: Vec<String>,
++}
++
++#[pymethods]
++impl SandboxConfig {
++    #[new]
++    #[pyo3(signature = (timeout_ms=30000, working_dir=None, allow_network=false))]
++    fn new(timeout_ms: u64, working_dir: Option<String>, allow_network: bool) -> Self {
++        Self {
++            timeout_ms,
++            working_dir,
++            allow_network,
++            read_only_paths: Vec::new(),
++            read_write_paths: Vec::new(),
++        }
++    }
++
++    fn add_read_only_path(&mut self, path: String) {
++        self.read_only_paths.push(path);
++    }
++
++    fn add_read_write_path(&mut self, path: String) {
++        self.read_write_paths.push(path);
++    }
++}
++
++/// Sandbox executor for running commands securely.
++#[pyclass]
++pub struct SandboxExecutor {
++    config: SandboxConfig,
++    runtime: tokio::runtime::Runtime,
++}
++
++#[pymethods]
++impl SandboxExecutor {
++    #[new]
++    #[pyo3(signature = (config=None))]
++    fn new(config: Option<SandboxConfig>) -> PyResult<Self> {
++        let config = config.unwrap_or_else(|| SandboxConfig::new(30000, None, false));
++        let runtime = tokio::runtime::Runtime::new()
++            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {e}")))?;
++        Ok(Self { config, runtime })
++    }
++
++    /// Execute a shell command in the sandbox.
++    #[pyo3(signature = (command, env=None))]
++    fn exec_command(&self, command: &str, env: Option<HashMap<String, String>>) -> PyResult<ExecResult> {
++        self.runtime.block_on(async {
++            exec_command_impl(command, &self.config, env).await
++        })
++    }
++
++    /// Execute Python code in the sandbox.
++    #[pyo3(signature = (code, env=None))]
++    fn exec_python(&self, code: &str, env: Option<HashMap<String, String>>) -> PyResult<ExecResult> {
++        let command = format!("python3 -c {}", shell_escape(code));
++        self.exec_command(&command, env)
++    }
++
++    /// Execute a Python file in the sandbox.
++    #[pyo3(signature = (path, args=None, env=None))]
++    fn exec_python_file(&self, path: &str, args: Option<Vec<String>>, env: Option<HashMap<String, String>>) -> PyResult<ExecResult> {
++        let args_str = args.map(|a| a.join(" ")).unwrap_or_default();
++        let command = format!("python3 {} {}", path, args_str);
++        self.exec_command(&command, env)
++    }
++
++    /// Execute bash script in the sandbox.
++    #[pyo3(signature = (script, env=None))]
++    fn exec_bash(&self, script: &str, env: Option<HashMap<String, String>>) -> PyResult<ExecResult> {
++        let command = format!("bash -c {}", shell_escape(script));
++        self.exec_command(&command, env)
++    }
++}
++
++/// Shell-escape a string for safe command execution.
++fn shell_escape(s: &str) -> String {
++    format!("'{}'", s.replace('\'', "'\\''"))
++}
++
++/// Internal implementation of command execution.
++async fn exec_command_impl(
++    command: &str,
++    config: &SandboxConfig,
++    env: Option<HashMap<String, String>>,
++) -> PyResult<ExecResult> {
++    use std::process::Stdio;
++    use tokio::process::Command;
++    use tokio::time::timeout;
++
++    let timeout_duration = Duration::from_millis(config.timeout_ms);
++    let start = std::time::Instant::now();
++
++    let mut cmd = Command::new("bash");
++    cmd.arg("-c").arg(command);
++    cmd.stdout(Stdio::piped());
++    cmd.stderr(Stdio::piped());
++
++    if let Some(cwd) = &config.working_dir {
++        cmd.current_dir(cwd);
++    }
++
++    if let Some(env_vars) = env {
++        for (key, value) in env_vars {
++            cmd.env(key, value);
++        }
++    }
++
++    let result = timeout(timeout_duration, cmd.output()).await;
++
++    let duration_ms = start.elapsed().as_millis() as u64;
++
++    match result {
++        Ok(Ok(output)) => {
++            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
++            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
++            let exit_code = output.status.code().unwrap_or(-1);
++
++            Ok(ExecResult {
++                success: output.status.success(),
++                exit_code,
++                stdout,
++                stderr,
++                duration_ms,
++            })
++        }
++        Ok(Err(e)) => Err(PyRuntimeError::new_err(format!("Execution failed: {e}"))),
++        Err(_) => Err(PyTimeoutError::new_err(format!(
++            "Command timed out after {}ms",
++            config.timeout_ms
++        ))),
++    }
++}
++
++/// Execute Python code with test assertions.
++#[pyfunction]
++#[pyo3(signature = (code, tests, timeout_ms=30000))]
++fn execute_python_tests(code: &str, tests: &str, timeout_ms: u64) -> PyResult<ExecResult> {
++    let config = SandboxConfig::new(timeout_ms, None, false);
++    let runtime = tokio::runtime::Runtime::new()
++        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {e}")))?;
++
++    let full_code = format!("{}\n\n{}", code, tests);
++    let command = format!("python3 -c {}", shell_escape(&full_code));
++
++    runtime.block_on(async {
++        exec_command_impl(&command, &config, None).await
++    })
++}
++
++/// Quick utility to run a single Python expression and get the result.
++#[pyfunction]
++#[pyo3(signature = (expr, timeout_ms=5000))]
++fn eval_python(expr: &str, timeout_ms: u64) -> PyResult<String> {
++    let config = SandboxConfig::new(timeout_ms, None, false);
++    let runtime = tokio::runtime::Runtime::new()
++        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {e}")))?;
++
++    let code = format!("print({})", expr);
++    let command = format!("python3 -c {}", shell_escape(&code));
++
++    let result = runtime.block_on(async {
++        exec_command_impl(&command, &config, None).await
++    })?;
++
++    if result.success {
++        Ok(result.stdout.trim().to_string())
++    } else {
++        Err(PyRuntimeError::new_err(result.stderr))
++    }
++}
++
++/// Python module definition.
++#[pymodule]
++fn codex_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
++    m.add_class::<ExecResult>()?;
++    m.add_class::<SandboxConfig>()?;
++    m.add_class::<SandboxExecutor>()?;
++    m.add_function(wrap_pyfunction!(execute_python_tests, m)?)?;
++    m.add_function(wrap_pyfunction!(eval_python, m)?)?;
++    Ok(())
++}

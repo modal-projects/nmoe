@@ -1,0 +1,19 @@
+[package]
+name = "codex-python"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Python bindings for codex-rs sandboxed execution"
+
+[lib]
+name = "codex_python"
+path = "lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+
+# Sandbox dependencies
+landlock = "0.4.4"
+seccompiler = "0.5.0"
+libc = "0.2.177"
