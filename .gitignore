@@ -73,6 +73,15 @@ torch_prof_*.tgz
 # Local scratch / snapshots
 tmp/
 
+# Vendor reference kernels (not shipped)
+nmoe/serve/*vllm*.cu
+nmoe/serve/*sglang*.cu
+nmoe/serve/kernels/*vllm*.cu
+nmoe/serve/kernels/*sglang*.cu
+
+# Backup files
+*.bak
+
 # OS junk
 .DS_Store
 Thumbs.db

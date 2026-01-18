@@ -15,8 +15,20 @@ import torch.distributed as dist
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description="nmoe.serve - DeepSeek-V3 inference server")
 
+  # Config file (new: takes precedence over CLI args when provided)
+  parser.add_argument(
+    "--config", "-c",
+    type=str,
+    help="Path to TOML config file. When provided, loads settings from config instead of CLI args.",
+  )
+  parser.add_argument(
+    "--doctor",
+    action="store_true",
+    help="Run preflight checks only (no server). Requires --config.",
+  )
+
   # Model
-  parser.add_argument("--model-path", type=str, required=True, help="Path to model checkpoint")
+  parser.add_argument("--model-path", type=str, help="Path to model checkpoint")
   parser.add_argument("--tokenizer-path", type=str, help="Path to tokenizer (default: model-path)")
 
   # Server
@@ -58,7 +70,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--enable-cuda-graph",
     action="store_true",
-    help="Enable CUDA-graph replay for greedy decode TOKENS (MLA-only; requires NMOE_DEEPEP_LOW_LATENCY=1).",
+    help="Enable CUDA-graph replay for greedy decode (MLA-only).",
   )
   parser.add_argument("--disable-prefix-cache", action="store_true", help="Disable prefix caching")
 
@@ -72,8 +84,49 @@ def parse_args() -> argparse.Namespace:
   return parser.parse_args()
 
 
+def _expand_env_vars(path: str) -> str:
+  """Expand ${VAR} patterns in path."""
+  if not path:
+    return path
+  import re
+  def replace(m):
+    var = m.group(1)
+    return os.environ.get(var, m.group(0))
+  return re.sub(r'\$\{(\w+)\}', replace, path)
+
+
 def main() -> int:
   args = parse_args()
+
+  # Handle --doctor without --config
+  if args.doctor and not args.config:
+    print("Error: --doctor requires --config", file=sys.stderr)
+    return 1
+
+  # Handle --config mode
+  serve_config = None
+  if args.config:
+    from nmoe.serve.config import ServeConfig
+    serve_config = ServeConfig.from_toml(args.config)
+    # Expand env vars in model_path
+    serve_config.model_path = _expand_env_vars(serve_config.model_path)
+
+  # Handle --doctor mode (runs preflight checks and exits)
+  if args.doctor:
+    from nmoe.serve.doctor import run_doctor
+    # Doctor checks need to run under torchrun for world_size check
+    rank_env = os.environ.get("RANK")
+    if rank_env is None:
+      print("Error: --doctor must be run under torchrun (use python -m nmoe.serve.launch --doctor)", file=sys.stderr)
+      return 1
+    rank = int(rank_env)
+    # Only rank 0 prints doctor output
+    if rank == 0:
+      passed = run_doctor(serve_config)
+      return 0 if passed else 1
+    else:
+      # Other ranks just exit silently
+      return 0
 
   # nmoe/serve production contract (management): TP=1/DP=8/EP=8, world_size=8.
   # We require torchrun because DeepEP collectives and dynamic disaggregation
@@ -84,7 +137,9 @@ def main() -> int:
     raise RuntimeError(
       "nmoe.serve must be launched via torchrun with world_size=8.\n"
       "Example:\n"
-      "  torchrun --nproc_per_node=8 --master_port=29530 -m nmoe.serve ..."
+      "  torchrun --nproc_per_node=8 --master_port=29530 -m nmoe.serve ...\n"
+      "Or use the launcher:\n"
+      "  python -m nmoe.serve.launch --config config.toml"
     )
 
   rank = int(rank_env)
@@ -95,14 +150,37 @@ def main() -> int:
   if int(args.tensor_parallel_size) != 1:
     raise RuntimeError(f"nmoe.serve requires --tensor-parallel-size=1 (got {args.tensor_parallel_size}).")
 
+  # When --config is provided, use config values; otherwise require CLI args
+  if serve_config:
+    model_path = serve_config.model_path
+    host = serve_config.host or args.host
+    port = serve_config.port or args.port
+    num_pages = serve_config.num_pages or args.num_pages
+    page_size = serve_config.kv_layout.page_size
+    max_batch_size = serve_config.max_batch_size
+    max_prefill_tokens = serve_config.max_prefill_tokens
+    config_max_seq_len = serve_config.max_seq_len
+  else:
+    if not args.model_path:
+      print("Error: --model-path is required (or use --config)", file=sys.stderr)
+      return 1
+    model_path = args.model_path
+    host = args.host
+    port = args.port
+    num_pages = args.num_pages
+    page_size = args.page_size
+    max_batch_size = args.max_batch_size
+    max_prefill_tokens = args.max_prefill_tokens
+    config_max_seq_len = args.max_seq_len
+
   # Only rank 0 prints startup info (avoid log spam)
   def log(msg: str) -> None:
     if rank == 0:
       print(msg, flush=True)
 
   log(f"nmoe.serve starting (world_size={world_size})...")
-  log(f"  Model: {args.model_path}")
-  log(f"  Host: {args.host}:{args.port} (rank 0 only)")
+  log(f"  Model: {model_path}")
+  log(f"  Host: {host}:{port} (rank 0 only)")
   log(
     f"  Limits (requested): max_prompt_tokens={args.max_prompt_tokens} (0=auto), "
     f"max_output_tokens={args.max_output_tokens}, max_pending={args.max_pending_requests}"
@@ -142,20 +220,20 @@ def main() -> int:
     print(f"  CUDA: {torch.cuda.get_device_name(device)}", flush=True)
 
   # Load tokenizer (all ranks need it for token counting in distributed scenarios)
-  tokenizer_path = args.tokenizer_path or args.model_path
+  tokenizer_path = args.tokenizer_path or model_path
   log(f"Loading tokenizer from {tokenizer_path}...")
   tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
   # Model config (auto-detect MLA vs DSA from checkpoint, or use explicit --attention-type)
   if args.attention_type == "auto":
-    model_config = load_model_config(args.model_path)
+    model_config = load_model_config(model_path)
     log(f"  Attention type: {model_config.attention_type} (auto-detected)")
   else:
     model_config = ModelConfig(attention_type=args.attention_type)
     log(f"  Attention type: {args.attention_type}")
 
   # Serving-time bounds must not exceed the checkpoint's supported max context.
-  max_seq_len = int(args.max_seq_len) if int(args.max_seq_len) > 0 else int(model_config.max_seq_len)
+  max_seq_len = int(config_max_seq_len) if int(config_max_seq_len) > 0 else int(model_config.max_seq_len)
   if max_seq_len > int(model_config.max_seq_len):
     raise RuntimeError(
       f"--max-seq-len={max_seq_len} exceeds checkpoint max_seq_len={int(model_config.max_seq_len)}. "
@@ -183,12 +261,12 @@ def main() -> int:
 
   # Engine config
   engine_config = EngineConfig(
-    num_pages=args.num_pages,
-    page_size=args.page_size,
+    num_pages=num_pages,
+    page_size=page_size,
     num_layers=model_config.num_layers,
     kv_lora_rank=model_config.kv_lora_rank,
     qk_rope_head_dim=model_config.qk_rope_head_dim,
-    max_batch_size=args.max_batch_size,
+    max_batch_size=max_batch_size,
     max_seq_len=max_seq_len,
     moe_expected_m=moe_expected_m,
     attention_type=model_config.attention_type,
@@ -198,11 +276,11 @@ def main() -> int:
 
   # Orchestrator config
   orch_config = OrchestratorConfig(
-    max_batch_size=args.max_batch_size,
-    max_prefill_tokens=args.max_prefill_tokens,
+    max_batch_size=max_batch_size,
+    max_prefill_tokens=max_prefill_tokens,
     max_seq_len=max_seq_len,
-    num_pages=args.num_pages,
-    page_size=args.page_size,
+    num_pages=num_pages,
+    page_size=page_size,
     enable_overlap=args.enable_overlap,
     enable_chunked_prefill=not args.disable_chunked_prefill,
     chunk_size=args.chunk_size,
@@ -226,19 +304,19 @@ def main() -> int:
   )
 
   # Load checkpoint
-  log(f"Loading checkpoint from {args.model_path}...")
-  shard_path = os.path.join(args.model_path, f"model{rank}-mp{world_size}.safetensors")
+  log(f"Loading checkpoint from {model_path}...")
+  shard_path = os.path.join(model_path, f"model{rank}-mp{world_size}.safetensors")
   if os.path.exists(shard_path):
     missing, unexpected = load_sharded_checkpoint(
       orchestrator.engine.model,
-      args.model_path,
+      model_path,
       rank=rank,
       world_size=world_size,
     )
   else:
     missing, unexpected = load_checkpoint(
       orchestrator.engine.model,
-      args.model_path,
+      model_path,
       rank=rank,
       world_size=world_size,
       cfg=model_config,
@@ -283,8 +361,8 @@ def main() -> int:
 
     import uvicorn
 
-    print(f"[Rank 0] Starting HTTP server on {args.host}:{args.port}...", flush=True)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    print(f"[Rank 0] Starting HTTP server on {host}:{port}...", flush=True)
+    uvicorn.run(app, host=host, port=port, log_level="info")
   else:
     # Ranks 1-7: Worker mode (no HTTP, just orchestrator loop)
     print(f"[Rank {rank}] Starting worker mode (lockstep with rank 0)...", flush=True)
