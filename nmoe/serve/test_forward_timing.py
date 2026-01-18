@@ -42,11 +42,11 @@ def main():
     positions = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
     kv_caches_latent = [
-        torch.zeros(total_blocks, 64, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device)
+        torch.zeros(total_blocks, 64, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
         for _ in range(cfg.num_layers)
     ]
     kv_caches_rope = [
-        torch.zeros(total_blocks, 64, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device)
+        torch.zeros(total_blocks, 64, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
         for _ in range(cfg.num_layers)
     ]
     block_table = torch.zeros(B, num_blocks, dtype=torch.int32, device=device)

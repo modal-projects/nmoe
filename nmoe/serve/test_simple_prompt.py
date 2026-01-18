@@ -23,41 +23,19 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 
-def _all_gather_vocab_shards(local_logits: torch.Tensor, world_size: int) -> torch.Tensor:
-  if world_size == 1:
-    return local_logits
-  parts = [torch.empty_like(local_logits) for _ in range(world_size)]
-  dist.all_gather(parts, local_logits.contiguous())
-  return torch.cat(parts, dim=-1)
+def _greedy_argmax(logits: torch.Tensor) -> int:
+  """Greedy argmax over full vocab logits (TP=1 mode)."""
+  return int(torch.argmax(logits, dim=-1).item())
 
 
-def _tp_greedy_argmax(local_logits: torch.Tensor, vocab_size: int, rank: int, world_size: int) -> int:
-  """Greedy argmax over vocab-parallel shards, returning global token id."""
-  if world_size == 1:
-    return int(torch.argmax(local_logits, dim=-1).item())
-
-  v_shard = int(local_logits.numel())
-  if v_shard * world_size != int(vocab_size):
-    raise ValueError(f"Vocab sharding mismatch: {v_shard}*{world_size} != {vocab_size}")
-
-  start = rank * v_shard
-  local_max, local_idx = torch.max(local_logits, dim=-1)
-  local_gid = local_idx.to(torch.int64) + int(start)
-
-  gathered_vals = [torch.empty_like(local_max) for _ in range(world_size)]
-  gathered_gids = [torch.empty_like(local_gid) for _ in range(world_size)]
-  dist.all_gather(gathered_vals, local_max.contiguous())
-  dist.all_gather(gathered_gids, local_gid.contiguous())
-
-  vals = torch.stack(gathered_vals, dim=0)  # [W]
-  gids = torch.stack(gathered_gids, dim=0)  # [W]
-  gmax = torch.max(vals, dim=0).values
-
-  # Tie-break deterministically by smallest global token id among max logits.
-  mask = vals == gmax.unsqueeze(0)
-  big = torch.full_like(gids, int(vocab_size) + 1)
-  candidates = torch.where(mask, gids, big)
-  return int(torch.min(candidates, dim=0).values.item())
+def _assert_all_ranks_equal(name: str, value: int, device: torch.device) -> None:
+  """Assert that all ranks computed the same integer value."""
+  t = torch.tensor([int(value)], dtype=torch.int64, device=device)
+  gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
+  dist.all_gather(gathered, t)
+  vals = [int(x.item()) for x in gathered]
+  if len(set(vals)) != 1:
+    raise RuntimeError(f"{name}: mismatch across ranks: {vals}")
 
 
 def main():
@@ -72,7 +50,8 @@ def main():
   from nmoe.serve.ckpt import load_checkpoint
   from deep_ep import Buffer
 
-  init_distributed(rank, world_size)
+  # TP=1 for EP-only bringup (replicated lm_head; no vocab sharding).
+  init_distributed(rank, world_size, tp_size=1)
 
   cfg = ModelConfig(num_layers=61, num_dense_layers=3)
 
@@ -149,16 +128,11 @@ def main():
       )
 
     # Decode token from vocab-sharded logits.
-    next_token = _tp_greedy_argmax(
-      logits[0, -1, :],
-      vocab_size=int(cfg.vocab_size),
-      rank=rank,
-      world_size=world_size,
-    )
+    next_token = _greedy_argmax(logits[0, -1, :])
+    _assert_all_ranks_equal("prefill_next_token", next_token, device)
 
     if rank == 0:
-      full_last = _all_gather_vocab_shards(logits[0, -1, :], world_size)
-      top5 = full_last.topk(5)
+      top5 = logits[0, -1, :].topk(5)
       print(f"Prefill top5: {top5.indices.tolist()} = {[tokenizer.decode([t]) for t in top5.indices.tolist()]}")
       generated.append(next_token)
 
@@ -179,12 +153,8 @@ def main():
           cache_seqlens_cpu=[cur_pos], out_loc=out_loc_decode,
         )
 
-      next_token = _tp_greedy_argmax(
-        logits[0, 0, :],
-        vocab_size=int(cfg.vocab_size),
-        rank=rank,
-        world_size=world_size,
-      )
+      next_token = _greedy_argmax(logits[0, 0, :])
+      _assert_all_ranks_equal("decode_next_token", next_token, device)
 
       if rank == 0:
         generated.append(next_token)

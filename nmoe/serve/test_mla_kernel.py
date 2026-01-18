@@ -26,7 +26,7 @@ def _create_mla_tensor(shape: tuple, dtype: torch.dtype, device: torch.device, i
 
     For MLA kernel:
     - Q tensors: shape (H, D, B) with D (dim 1) having stride=1
-    - KV cache: shape (pages, page_size, D) with page_size (dim 1) having stride=1
+    - KV cache: shape (page_size, D, pages) with D (dim 1) having stride=1
     """
     # Generic helper: create tensor with stride[leading_dim]=1
     def make_with_leading_dim(target_shape: tuple, leading_dim: int) -> torch.Tensor:
@@ -41,7 +41,7 @@ def _create_mla_tensor(shape: tuple, dtype: torch.dtype, device: torch.device, i
         return t.permute(*inv_perm)
 
     if is_paged:
-        # (pages, page_size, D) with stride[1]=1
+        # (page_size, D, pages) with stride[1]=1
         return make_with_leading_dim(shape, 1)
     else:
         # (H, D, B) with stride[1]=1
@@ -75,13 +75,13 @@ class TestMlaKernel(unittest.TestCase):
             max_seq_len=seq_len,
             page_size=page_size,
             device=device,
+            c_latent=_create_mla_tensor((page_size, L, num_pages), torch.bfloat16, device, is_paged=True),
+            c_rope=_create_mla_tensor((page_size, R, num_pages), torch.bfloat16, device, is_paged=True),
         )
 
         # Create inputs with correct layout
-        q_latent = _create_mla_tensor((H, L, B), torch.float16, device)
-        q_rope = _create_mla_tensor((H, R, B), torch.float16, device)
-        c_latent = _create_mla_tensor((num_pages, page_size, L), torch.float16, device, is_paged=True)
-        c_rope = _create_mla_tensor((num_pages, page_size, R), torch.float16, device, is_paged=True)
+        q_latent = _create_mla_tensor((H, L, B), torch.bfloat16, device)
+        q_rope = _create_mla_tensor((H, R, B), torch.bfloat16, device)
 
         # Page table: [num_pages, B] with stride[0]=1
         # Create (B, num_pages) then permute (without contiguous!)
@@ -97,12 +97,12 @@ class TestMlaKernel(unittest.TestCase):
         softmax_scale = 1.0 / math.sqrt(L + R)
 
         # Run kernel
-        out, lse = kernel(q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, softmax_scale)
+        out, lse = kernel(q_latent, q_rope, page_table, cache_seqs, softmax_scale)
 
         # Check outputs
         self.assertEqual(out.shape, (H, L, B))
         self.assertEqual(lse.shape, (H, B))
-        self.assertEqual(out.dtype, torch.float16)
+        self.assertEqual(out.dtype, torch.bfloat16)
         self.assertEqual(lse.dtype, torch.float32)
 
         # Check no NaN/Inf
@@ -128,13 +128,13 @@ class TestMlaKernel(unittest.TestCase):
             kernel = _CompiledMlaKernel(
                 num_heads=H, max_batch=B, max_seq_len=page_size * num_pages,
                 page_size=page_size, device=device,
+                c_latent=_create_mla_tensor((page_size, L, num_pages), torch.bfloat16, device, is_paged=True),
+                c_rope=_create_mla_tensor((page_size, R, num_pages), torch.bfloat16, device, is_paged=True),
             )
 
             # Create inputs with correct layout
-            q_latent = _create_mla_tensor((H, L, B), torch.float16, device)
-            q_rope = _create_mla_tensor((H, R, B), torch.float16, device)
-            c_latent = _create_mla_tensor((num_pages, page_size, L), torch.float16, device, is_paged=True)
-            c_rope = _create_mla_tensor((num_pages, page_size, R), torch.float16, device, is_paged=True)
+            q_latent = _create_mla_tensor((H, L, B), torch.bfloat16, device)
+            q_rope = _create_mla_tensor((H, R, B), torch.bfloat16, device)
 
             # Page table with stride[0]=1
             page_table = torch.empty(B, num_pages, dtype=torch.int32, device=device)
@@ -143,7 +143,7 @@ class TestMlaKernel(unittest.TestCase):
             page_table = page_table.permute(1, 0)
             cache_seqs = torch.full((B,), page_size * num_pages, dtype=torch.int32, device=device)
 
-            out, lse = kernel(q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, 1.0 / math.sqrt(576))
+            out, lse = kernel(q_latent, q_rope, page_table, cache_seqs, 1.0 / math.sqrt(576))
 
             self.assertEqual(out.shape, (H, L, B))
             self.assertFalse(torch.isnan(out).any())

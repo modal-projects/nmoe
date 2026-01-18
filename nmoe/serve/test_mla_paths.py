@@ -27,8 +27,10 @@ def test_mla_paths():
     mla = MLA(cfg, layer_idx=0).to(device).eval()
 
     # Allocate caches
-    kv_cache_latent = torch.zeros(num_pages, page_size, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device)
-    kv_cache_rope = torch.zeros(num_pages, page_size, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device)
+    # CuTeDSL layout: (page_size, D, num_pages) with D stride=1, backed by a
+    # contiguous (num_pages, page_size, D) allocation (pages are contiguous blocks).
+    kv_cache_latent = torch.zeros(num_pages, page_size, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
+    kv_cache_rope = torch.zeros(num_pages, page_size, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
 
     # Block table: each sequence uses sequential pages
     block_table = torch.zeros(B, max_blocks, dtype=torch.int32, device=device)

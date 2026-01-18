@@ -34,6 +34,7 @@ from nmoe.serve.model import (
     apply_rotary_emb,
     weight_dequant,
     _world_size,
+    _tp_size,
 )
 
 
@@ -72,7 +73,9 @@ class DSA(nn.Module):
         self.layer_idx = int(layer_idx)
         self.hidden_size = int(cfg.hidden_size)
         self.num_heads = int(cfg.num_heads)
-        self.num_local_heads = int(cfg.num_heads // _world_size)
+        # Heads are sharded only by attention TP (not EP/world_size).
+        # In EP-only serving (tp_size=1), every rank holds all heads.
+        self.num_local_heads = int(cfg.num_heads // _tp_size)
 
         self.q_lora_rank = int(cfg.q_lora_rank)
         self.kv_lora_rank = int(cfg.kv_lora_rank)

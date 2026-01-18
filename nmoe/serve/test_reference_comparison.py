@@ -32,8 +32,9 @@ import torch
 import torch.distributed as dist
 
 
-CKPT_PATH = os.environ.get("NMOE_MODEL_PATH", "/data/models/DeepSeek-V3.2-Speciale")
-CKPT_PATH_MP8 = os.environ.get("NMOE_MODEL_PATH_MP", "/data/models/DeepSeek-V3.2-Speciale-mp8")
+CKPT_PATH = os.environ.get("NMOE_MODEL_PATH", "/data/models/DeepSeek-V3.2-Speciale")  # reference HF dir
+OUR_CKPT_PATH = os.environ.get("NMOE_OUR_MODEL_PATH", "")  # nmoe EP8-TP1 dir
+CKPT_PATH_MP8 = os.environ.get("NMOE_REFERENCE_MP_DIR", os.environ.get("NMOE_MODEL_PATH_MP", "/data/models/DeepSeek-V3.2-Speciale-mp8"))
 CONFIG_PATH = os.environ.get("NMOE_REFERENCE_CONFIG", f"{CKPT_PATH}/inference/config_671B_v3.2.json")
 REFERENCE_DIR = os.environ.get("NMOE_REFERENCE_DIR", f"{CKPT_PATH}/inference")
 GOLDEN_OUTPUT_PATH = os.environ.get("NMOE_REFERENCE_GOLDEN", "/tmp/reference_logits.pt")
@@ -47,9 +48,23 @@ TEST_INPUTS = [
 
 def run_reference_model(rank: int, world_size: int) -> torch.Tensor:
   """Run the reference implementation and return logits."""
+  # Patch the reference's `from kernel import ...` to use our torch implementation
+  # (TileLang/TVM cannot currently JIT for SM100a in this container).
+  from nmoe.serve import ref_kernel_torch as torch_kernel
+  prev_kernel = sys.modules.get("kernel")
+  sys.modules["kernel"] = torch_kernel
+
   sys.path.insert(0, REFERENCE_DIR)
-  from model import Transformer, ModelArgs
-  from safetensors.torch import load_model
+  try:
+    from model import Transformer, ModelArgs  # type: ignore
+    from safetensors.torch import load_model
+  except Exception:
+    sys.path.remove(REFERENCE_DIR)
+    if prev_kernel is None:
+      sys.modules.pop("kernel", None)
+    else:
+      sys.modules["kernel"] = prev_kernel
+    raise
 
   with open(CONFIG_PATH) as f:
     args = ModelArgs(**json.load(f))
@@ -76,38 +91,52 @@ def run_reference_model(rank: int, world_size: int) -> torch.Tensor:
     all_logits.append(logits.cpu())
 
   sys.path.remove(REFERENCE_DIR)
+  if prev_kernel is None:
+    sys.modules.pop("kernel", None)
+  else:
+    sys.modules["kernel"] = prev_kernel
   return all_logits
 
 
 def run_our_model(rank: int, world_size: int) -> torch.Tensor:
   """Run our implementation and return logits."""
-  from nmoe.serve.model import ModelConfig, DeepSeekV3, init_distributed
-  from nmoe.serve.ckpt import load_checkpoint
-  from deep_ep import Buffer
+  mode = os.environ.get("NMOE_EP_TRANSPORT", "rdep").strip().lower()
+  if mode != "rdep":
+    raise RuntimeError(f"test_reference_comparison requires NMOE_EP_TRANSPORT=rdep (got {mode!r})")
+  if not OUR_CKPT_PATH:
+    raise RuntimeError("NMOE_OUR_MODEL_PATH is required (nmoe EP8-TP1 checkpoint dir).")
 
-  init_distributed(rank, world_size)
+  # Use a shared per-run extensions dir across ranks to avoid JIT skew causing
+  # barrier/collective timeouts.
+  master_port = os.environ.get("MASTER_PORT", "0")
+  os.environ.setdefault("TORCH_EXTENSIONS_DIR", f"/tmp/torch_extensions_nmoe_{master_port}")
+  os.makedirs(os.environ["TORCH_EXTENSIONS_DIR"], exist_ok=True)
 
-  # Full model config
-  cfg = ModelConfig(num_layers=61, num_dense_layers=3)
+  from nmoe.serve.ckpt import load_checkpoint, load_model_config
+  from nmoe.serve.engine import Engine, EngineConfig
 
-  # DeepEP buffer
-  hidden_bytes = cfg.hidden_size * 2
-  dispatch_config = Buffer.get_dispatch_config(world_size)
-  combine_config = Buffer.get_combine_config(world_size)
-  num_nvl_bytes = max(
-    dispatch_config.get_nvl_buffer_size_hint(hidden_bytes, world_size),
-    combine_config.get_nvl_buffer_size_hint(hidden_bytes, world_size),
+  cfg = load_model_config(OUR_CKPT_PATH)
+  engine_cfg = EngineConfig(
+    num_pages=8,
+    page_size=64,
+    num_layers=int(cfg.num_layers),
+    kv_lora_rank=int(getattr(cfg, "kv_lora_rank", 0)),
+    qk_rope_head_dim=int(getattr(cfg, "qk_rope_head_dim", 0)),
+    max_batch_size=32,
+    max_seq_len=512,
+    max_step_tokens=256,
+    attention_type=str(getattr(cfg, "attention_type", "dsa")),
+    idx_dim=int(getattr(cfg, "dsa_idx_dim", 128)),
+    tp_size=1,
   )
 
-  buffer = Buffer(group=dist.group.WORLD, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=0)
-
+  engine = Engine(cfg, engine_cfg, rank=rank, world_size=world_size)
   device = torch.device(f"cuda:{rank}")
-  model = DeepSeekV3(cfg, buffer).to(device)
-  model.eval()
+  model = engine.model
 
   if rank == 0:
-    print(f"Loading our model from {CKPT_PATH}")
-  load_checkpoint(model, CKPT_PATH, rank=rank, world_size=world_size, cfg=cfg)
+    print(f"Loading our model from {OUR_CKPT_PATH}")
+  load_checkpoint(model, OUR_CKPT_PATH, rank=rank, world_size=world_size, cfg=cfg)
 
   # Run forward pass
   all_logits = []
@@ -203,6 +232,10 @@ def main():
   dist.init_process_group(backend="nccl")
   rank = dist.get_rank()
   world_size = dist.get_world_size()
+
+  mode = os.environ.get("NMOE_EP_TRANSPORT", "rdep").strip().lower()
+  if mode != "rdep":
+    raise RuntimeError(f"test_reference_comparison requires NMOE_EP_TRANSPORT=rdep (got {mode!r})")
 
   device = torch.device(f"cuda:{rank}")
   torch.cuda.set_device(device)

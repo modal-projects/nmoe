@@ -59,6 +59,7 @@ class InputBuffers:
     device: torch.device,
     max_batch_size: int,
     max_seq_len: int,
+    max_total_seq_len: int = None,
     page_size: int,
   ) -> "InputBuffers":
     """Create pre-allocated buffers.
@@ -66,10 +67,13 @@ class InputBuffers:
     Args:
       device: GPU device for tensor allocation
       max_batch_size: Maximum requests per batch
-      max_seq_len: Maximum sequence length (for prefill chunks)
+      max_seq_len: Maximum sequence length per step (for prefill chunks)
+      max_total_seq_len: Maximum total sequence length for block_table (defaults to max_seq_len)
       page_size: KV cache page size (typically 64)
     """
-    max_pages_per_seq = (max_seq_len + page_size - 1) // page_size
+    if max_total_seq_len is None:
+      max_total_seq_len = max_seq_len
+    max_pages_per_seq = (max_total_seq_len + page_size - 1) // page_size
 
     with torch.device(device):
       # GPU tensors - pre-allocated to max size

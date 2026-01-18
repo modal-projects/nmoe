@@ -4218,9 +4218,9 @@ class BlackwellMultiHeadLatentAttentionForward:
         """
         if L != 512 or R != 64:
             return False
-        if in_dtype not in [cutlass.Float8E4M3FN, cutlass.Float16]:
+        if in_dtype not in [cutlass.Float8E4M3FN, cutlass.BFloat16]:
             return False
-        if out_dtype not in [cutlass.Float8E4M3FN, cutlass.Float16]:
+        if out_dtype not in [cutlass.Float8E4M3FN, cutlass.BFloat16]:
             return False
         if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
             return False
@@ -4258,6 +4258,7 @@ def ceil_div(a: int, b: int) -> int:
 # =============================================================================
 
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nmoe.serve.model import (
     ModelConfig,
@@ -4331,8 +4332,8 @@ class MLA(nn.Module):
         x: torch.Tensor,                # [B,S,D]
         freqs_cis: torch.Tensor,        # [B,S,rope_dim/2] complex
         *,
-        kv_cache_latent: torch.Tensor,  # [num_pages, page_size, 512]
-        kv_cache_rope: torch.Tensor,    # [num_pages, page_size, 64]
+        kv_cache_latent: torch.Tensor,  # [page_size, 512, num_pages] (CuTeDSL layout; dim1 stride=1)
+        kv_cache_rope: torch.Tensor,    # [page_size, 64, num_pages] (CuTeDSL layout; dim1 stride=1)
         block_table: torch.Tensor,      # [B, max_blocks] int32
         cache_seqlens: torch.Tensor,    # [B] int32 - seq lens AFTER this forward
         out_loc: torch.Tensor,          # [B,S] int32
@@ -4356,32 +4357,112 @@ class MLA(nn.Module):
         is_paged_prefill = (prefill_mode == "paged")
         is_decode = (prefill_mode is None)  # S should be 1
 
+        # KV cache layout normalization.
+        #
+        # CuTeDSL kernel expects KV in (page_size, D, num_pages) with D stride=1.
+        # Some callers may hold the authoritative storage as (num_pages, page_size, D)
+        # and pass views. Support both by deriving a "kernel view" and a "base view"
+        # for index_copy writes.
+        def _kv_views(kv_latent: torch.Tensor, kv_rope: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            if kv_latent.ndim != 3 or kv_rope.ndim != 3:
+                raise RuntimeError("kv_cache_latent/rope must be 3D tensors.")
+            if kv_latent.shape[1] == self.LATENT_DIM:
+                # Expected kernel view: (page_size, D_latent, num_pages)
+                latent_view = kv_latent
+                latent_base = kv_latent.permute(2, 0, 1)
+            elif kv_latent.shape[2] == self.LATENT_DIM:
+                # Base storage view: (num_pages, page_size, D_latent)
+                latent_base = kv_latent
+                latent_view = kv_latent.permute(1, 2, 0)
+            else:
+                raise RuntimeError(f"kv_cache_latent has unexpected shape {tuple(kv_latent.shape)} for LATENT_DIM={self.LATENT_DIM}.")
+
+            page_size = int(latent_view.shape[0])
+            num_pages = int(latent_view.shape[2])
+            # Rope must match the latent layout; ROPE_DIM can equal page_size (both 64),
+            # so avoid ambiguous heuristics based solely on ROPE_DIM.
+            if tuple(kv_rope.shape) == (page_size, int(self.ROPE_DIM), num_pages):
+                rope_view = kv_rope
+                rope_base = kv_rope.permute(2, 0, 1)
+            elif tuple(kv_rope.shape) == (num_pages, page_size, int(self.ROPE_DIM)):
+                rope_base = kv_rope
+                rope_view = kv_rope.permute(1, 2, 0)
+            else:
+                raise RuntimeError(
+                    f"kv_cache_rope has unexpected shape {tuple(kv_rope.shape)}; expected "
+                    f"({page_size},{int(self.ROPE_DIM)},{num_pages}) or ({num_pages},{page_size},{int(self.ROPE_DIM)})."
+                )
+
+            return latent_view, latent_base, rope_view, rope_base
+
+        kv_latent_view, kv_latent_base, kv_rope_view, kv_rope_base = _kv_views(kv_cache_latent, kv_cache_rope)
+
         # === Q projection (same for all paths) ===
         # FP8Linear currently quantizes activations in Python. For MLA we can reuse a
         # single activation quantization for all projections that share the same input
         # `x` (notably wq_a/wq and wkv_a), avoiding duplicate quant work.
         _maybe_set_cutlass_path()
-        from deep_gemm import fp8_gemm_nt
 
         x_flat = x.reshape(-1, self.hidden_size)
-        # Quantize input to FP8 without host sync (.item()).
-        # DeepGEMM expects per-token-group (K//128) UE8M0 (power-of-2) scales.
-        _require(self.hidden_size % 128 == 0, f"hidden_size ({self.hidden_size}) must be divisible by 128.")
-        x_view = x_flat.to(torch.bfloat16).view(x_flat.size(0), self.hidden_size // 128, 128)
-        x_scales = x_view.float().abs().amax(dim=-1).clamp(min=1e-4) / 448.0  # [T, K//128]
-        x_scales = torch.pow(2.0, torch.ceil(torch.log2(x_scales)))  # UE8M0
-        x_fp8 = (x_view.float() / x_scales.unsqueeze(-1)).to(torch.float8_e4m3fn).view_as(x_flat)
-        x_scale = x_scales.to(torch.float32)
+        x_flat_bf16 = x_flat.to(torch.bfloat16)
+
+        wq_a_bf16 = getattr(self.wq_a, "weight_bf16", None) if self.q_lora_rank > 0 else None
+        wkv_a_bf16 = getattr(self.wkv_a, "weight_bf16", None)
+        # Prefer BF16 projection weights when available to avoid per-step FP8 activation
+        # quantization/casts and to reduce numerical drift between MLA prefill paths.
+        use_bf16_wq_a = bool(wq_a_bf16 is not None and wq_a_bf16.numel() != 0)
+        use_bf16_wkv_a = bool(wkv_a_bf16 is not None and wkv_a_bf16.numel() != 0)
+        need_x_fp8 = (self.q_lora_rank == 0) or (not use_bf16_wq_a) or (not use_bf16_wkv_a)
+
+        if need_x_fp8:
+            from deep_gemm import fp8_gemm_nt
+            # Quantize input activations to FP8 using fused UE8M0 kernel.
+            # DeepGEMM expects per-token-group (K//128) UE8M0 (power-of-2) scales.
+            _require(self.hidden_size % 128 == 0, f"hidden_size ({self.hidden_size}) must be divisible by 128.")
+            from nmoe.serve.kernels import quantize_fp8_ue8m0, pack_fp32_ue8m0_scales_to_int
+
+            # Defensive: avoid a <<<0, ...>>> kernel launch when T==0.
+            if x_flat.numel() == 0:
+                x_fp8 = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
+                x_scale = torch.empty((0, self.hidden_size // 128), device=x.device, dtype=torch.float32)
+            else:
+                x_fp8, x_scale = quantize_fp8_ue8m0(x_flat_bf16.contiguous())
+            x_scale_ue8m0 = pack_fp32_ue8m0_scales_to_int(
+                x_scale,
+                mn=int(x_flat.size(0)),
+                k=int(self.hidden_size),
+                gran_mn_in=1,
+            )
 
         # Q projection
         if self.q_lora_rank > 0:
             q_a_flat = torch.empty(x_flat.size(0), self.q_lora_rank, dtype=torch.bfloat16, device=x.device)
-            fp8_gemm_nt((x_fp8, x_scale), (self.wq_a.weight, self.wq_a.weight_scale_inv), q_a_flat, self.wq_a.bias)
+            if use_bf16_wq_a:
+                bias = getattr(self.wq_a, "bias_bf16", None)
+                if bias is not None and bias.numel() == 0:
+                    bias = None
+                q_a_flat.copy_(F.linear(x_flat_bf16, wq_a_bf16, bias))
+            else:
+                from deep_gemm import fp8_gemm_nt
+                fp8_gemm_nt(
+                    (x_fp8, x_scale_ue8m0),
+                    (self.wq_a.weight, self.wq_a._get_weight_scale_inv_ue8m0()),
+                    q_a_flat,
+                    self.wq_a.bias,
+                    disable_ue8m0_cast=True,
+                )
             q_a = q_a_flat.view(*x.shape[:-1], self.q_lora_rank)
             q = self.wq_b(self.q_norm(q_a))
         else:
             q_flat = torch.empty(x_flat.size(0), self.num_heads * self.qk_head_dim, dtype=torch.bfloat16, device=x.device)
-            fp8_gemm_nt((x_fp8, x_scale), (self.wq.weight, self.wq.weight_scale_inv), q_flat, self.wq.bias)
+            from deep_gemm import fp8_gemm_nt
+            fp8_gemm_nt(
+                (x_fp8, x_scale_ue8m0),
+                (self.wq.weight, self.wq._get_weight_scale_inv_ue8m0()),
+                q_flat,
+                self.wq.bias,
+                disable_ue8m0_cast=True,
+            )
             q = q_flat.view(*x.shape[:-1], q_flat.size(1))
         q = q.view(B, S, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -4389,7 +4470,20 @@ class MLA(nn.Module):
 
         # === KV projection (same for all paths) ===
         kv_flat = torch.empty(x_flat.size(0), self.kv_lora_rank + self.qk_rope_head_dim, dtype=torch.bfloat16, device=x.device)
-        fp8_gemm_nt((x_fp8, x_scale), (self.wkv_a.weight, self.wkv_a.weight_scale_inv), kv_flat, self.wkv_a.bias)
+        if use_bf16_wkv_a:
+            bias = getattr(self.wkv_a, "bias_bf16", None)
+            if bias is not None and bias.numel() == 0:
+                bias = None
+            kv_flat.copy_(F.linear(x_flat_bf16, wkv_a_bf16, bias))
+        else:
+            from deep_gemm import fp8_gemm_nt
+            fp8_gemm_nt(
+                (x_fp8, x_scale_ue8m0),
+                (self.wkv_a.weight, self.wkv_a._get_weight_scale_inv_ue8m0()),
+                kv_flat,
+                self.wkv_a.bias,
+                disable_ue8m0_cast=True,
+            )
         kv = kv_flat.view(*x.shape[:-1], kv_flat.size(1))
         kv_latent, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_latent = self.kv_norm(kv_latent)
@@ -4437,10 +4531,19 @@ class MLA(nn.Module):
 
             out = out.view(B, S, self.num_local_heads, self.v_head_dim).to(x.dtype)
 
-            # Store compressed KV to cache for future decode
+            # Store compressed KV to cache for future decode.
+            #
+            # KV cache is in CuTeDSL layout: (page_size, D, num_pages), backed by a
+            # contiguous (num_pages, page_size, D) allocation. `out_loc` is the
+            # physical slot id: loc = page_id*page_size + offset, so we can use it
+            # directly as a linear index into (num_pages, page_size, D).
             loc = out_loc.view(-1).to(torch.int64)
-            kv_cache_latent.view(-1, self.kv_lora_rank).index_copy_(0, loc, kv_latent.view(-1, self.kv_lora_rank))
-            kv_cache_rope.view(-1, self.qk_rope_head_dim).index_copy_(0, loc, k_rope.view(-1, self.qk_rope_head_dim))
+            kv_latent_base.reshape(-1, self.kv_lora_rank).index_copy_(
+                0, loc, kv_latent.reshape(-1, self.kv_lora_rank)
+            )
+            kv_rope_base.reshape(-1, self.qk_rope_head_dim).index_copy_(
+                0, loc, k_rope.reshape(-1, self.qk_rope_head_dim)
+            )
 
             return self.wo(out.flatten(2))
 
@@ -4452,10 +4555,14 @@ class MLA(nn.Module):
             if positions is None:
                 raise ValueError("positions required for paged prefill (S>1 with cached prefix)")
 
-            # Store KV first (all tokens including current are in cache)
+            # Store KV first (all tokens including current are in cache).
             loc = out_loc.view(-1).to(torch.int64)
-            kv_cache_latent.view(-1, self.kv_lora_rank).index_copy_(0, loc, kv_latent.view(-1, self.kv_lora_rank))
-            kv_cache_rope.view(-1, self.qk_rope_head_dim).index_copy_(0, loc, k_rope.view(-1, self.qk_rope_head_dim))
+            kv_latent_base.reshape(-1, self.kv_lora_rank).index_copy_(
+                0, loc, kv_latent.reshape(-1, self.kv_lora_rank)
+            )
+            kv_rope_base.reshape(-1, self.qk_rope_head_dim).index_copy_(
+                0, loc, k_rope.reshape(-1, self.qk_rope_head_dim)
+            )
 
             # Absorbed Q (latent space)
             q_latent = torch.einsum("bshd,hdc->bshc", q_nope, W[:, :self.qk_nope_head_dim])
@@ -4466,49 +4573,53 @@ class MLA(nn.Module):
             block_table_expanded = block_table.unsqueeze(1).expand(B, S, -1).reshape(B * S, -1)
             batch_size = B * S
 
-            # Init/reinit kernel for expanded batch
-            kernel_needs_cache_sync = False
-            if self._kernel is None or self._kernel.max_batch < batch_size:
+            # Init/reinit kernel for expanded batch (CuTeDSL reads KV directly from the
+            # authoritative cache buffers; no staging/sync copies).
+            kernel = self._kernel
+            kv_matches = bool(
+                kernel is not None
+                and int(kernel._c_latent_data.data_ptr()) == int(kv_latent_view.data_ptr())
+                and int(kernel._c_rope_data.data_ptr()) == int(kv_rope_view.data_ptr())
+                and tuple(kernel._c_latent_data.shape) == tuple(kv_latent_view.shape)
+                and tuple(kernel._c_rope_data.shape) == tuple(kv_rope_view.shape)
+            )
+            if kernel is None or kernel.max_batch < batch_size or not kv_matches:
+                page_size = int(kv_latent_view.shape[0])
+                num_pages = int(kv_latent_view.shape[2])
                 self._kernel = _CompiledMlaKernel(
                     num_heads=self.num_local_heads,
                     max_batch=batch_size,
-                    max_seq_len=kv_cache_latent.shape[0] * kv_cache_latent.shape[1],
-                    page_size=kv_cache_latent.shape[1],
+                    max_seq_len=num_pages * page_size,
+                    page_size=page_size,
                     device=x.device,
+                    c_latent=kv_latent_view,
+                    c_rope=kv_rope_view,
                 )
-                kernel_needs_cache_sync = True
-
-            # CuTeDSL expects KV in (page_size, D, num_pages) layout. Keep an internal
-            # float16 copy in that layout and update incrementally.
-            page_size = int(kv_cache_latent.shape[1])
-            num_pages = int(kv_cache_latent.shape[0])
-            if kernel_needs_cache_sync:
-                self._kernel.c_latent_buffer[:, :, :num_pages].copy_(
-                    kv_cache_latent.permute(1, 2, 0).to(torch.float16)
-                )
-                self._kernel.c_rope_buffer[:, :, :num_pages].copy_(
-                    kv_cache_rope.permute(1, 2, 0).to(torch.float16)
-                )
-            else:
-                loc_page = torch.div(loc, page_size, rounding_mode="floor")
-                loc_off = loc - loc_page * page_size
-                self._kernel.c_latent_buffer[loc_off, :, loc_page] = kv_latent.view(-1, self.kv_lora_rank).to(torch.float16)
-                self._kernel.c_rope_buffer[loc_off, :, loc_page] = k_rope.view(-1, self.qk_rope_head_dim).to(torch.float16)
 
             # Populate per-call kernel inputs and run in-place.
             max_blocks = int(block_table_expanded.shape[1])
             self._kernel.q_latent_buffer[:, :, :batch_size].copy_(
-                q_latent.view(batch_size, self.num_local_heads, self.kv_lora_rank).permute(1, 2, 0).to(torch.float16)
+                q_latent.view(batch_size, self.num_local_heads, self.kv_lora_rank).permute(1, 2, 0)
             )
             self._kernel.q_rope_buffer[:, :, :batch_size].copy_(
-                q_pe.view(batch_size, self.num_local_heads, self.qk_rope_head_dim).permute(1, 2, 0).to(torch.float16)
+                q_pe.view(batch_size, self.num_local_heads, self.qk_rope_head_dim).permute(1, 2, 0)
             )
-            self._kernel.page_table_buffer[:max_blocks, :batch_size].copy_(block_table_expanded.T)
+            # CuTeDSL kernel page-table capacity is set by KV max_pages (num_pages), but
+            # callers may pass a larger block_table that is sized to a global max_seq_len.
+            # Clamp the copy to the kernel's page table buffer; the kernel uses
+            # cache_seqs_buffer to determine how many blocks are actually read.
+            max_blocks = min(max_blocks, int(self._kernel.page_table_buffer.shape[0]))
+            self._kernel.page_table_buffer[:max_blocks, :batch_size].copy_(block_table_expanded.T[:max_blocks])
             self._kernel.cache_seqs_buffer[:batch_size].copy_(cache_seqlens_per_token)
-            out_latent, _ = self._kernel.run_inplace(batch_size, num_pages, float(self.softmax_scale))
+            # CuTeDSL uses cache_seqs_buffer to determine active slots. Always clear
+            # stale entries beyond the current batch to avoid "phantom" attention work
+            # (e.g., after token-parallel prefill resized max_batch).
+            if batch_size < int(self._kernel.cache_seqs_buffer.numel()):
+                self._kernel.cache_seqs_buffer[batch_size:].zero_()
+            out_latent, _ = self._kernel.run_inplace(batch_size, float(self.softmax_scale))
 
             out_latent = out_latent.permute(2, 0, 1).view(B, S, self.num_local_heads, self.kv_lora_rank)
-            out = torch.einsum("bshc,hdc->bshd", out_latent.to(x.dtype), W[:, -self.v_head_dim:])
+            out = torch.einsum("bshc,hdc->bshd", out_latent, W[:, -self.v_head_dim:])
             return self.wo(out.flatten(2))
 
         else:
@@ -4517,55 +4628,58 @@ class MLA(nn.Module):
             # =================================================================
             # Store KV
             loc = out_loc.view(-1).to(torch.int64)
-            kv_cache_latent.view(-1, self.kv_lora_rank).index_copy_(0, loc, kv_latent.view(-1, self.kv_lora_rank))
-            kv_cache_rope.view(-1, self.qk_rope_head_dim).index_copy_(0, loc, k_rope.view(-1, self.qk_rope_head_dim))
+            kv_latent_base.reshape(-1, self.kv_lora_rank).index_copy_(
+                0, loc, kv_latent.reshape(-1, self.kv_lora_rank)
+            )
+            kv_rope_base.reshape(-1, self.qk_rope_head_dim).index_copy_(
+                0, loc, k_rope.reshape(-1, self.qk_rope_head_dim)
+            )
 
             # Absorbed Q
             q_latent = torch.einsum("bshd,hdc->bshc", q_nope, W[:, :self.qk_nope_head_dim])
 
-            # Init/reinit kernel
-            kernel_needs_cache_sync = False
-            if self._kernel is None or self._kernel.max_batch < B:
+            # Init/reinit kernel (CuTeDSL reads KV directly from the authoritative cache).
+            kernel = self._kernel
+            kv_matches = bool(
+                kernel is not None
+                and int(kernel._c_latent_data.data_ptr()) == int(kv_latent_view.data_ptr())
+                and int(kernel._c_rope_data.data_ptr()) == int(kv_rope_view.data_ptr())
+                and tuple(kernel._c_latent_data.shape) == tuple(kv_latent_view.shape)
+                and tuple(kernel._c_rope_data.shape) == tuple(kv_rope_view.shape)
+            )
+            if kernel is None or kernel.max_batch < B or not kv_matches:
+                page_size = int(kv_latent_view.shape[0])
+                num_pages = int(kv_latent_view.shape[2])
                 self._kernel = _CompiledMlaKernel(
                     num_heads=self.num_local_heads,
                     max_batch=B,
-                    max_seq_len=kv_cache_latent.shape[0] * kv_cache_latent.shape[1],
-                    page_size=kv_cache_latent.shape[1],
+                    max_seq_len=num_pages * page_size,
+                    page_size=page_size,
                     device=x.device,
+                    c_latent=kv_latent_view,
+                    c_rope=kv_rope_view,
                 )
-                kernel_needs_cache_sync = True
-
-            # CuTeDSL expects KV in (page_size, D, num_pages) layout. Keep an internal
-            # float16 copy in that layout and update incrementally.
-            page_size = int(kv_cache_latent.shape[1])
-            num_pages = int(kv_cache_latent.shape[0])
-            if kernel_needs_cache_sync:
-                self._kernel.c_latent_buffer[:, :, :num_pages].copy_(
-                    kv_cache_latent.permute(1, 2, 0).to(torch.float16)
-                )
-                self._kernel.c_rope_buffer[:, :, :num_pages].copy_(
-                    kv_cache_rope.permute(1, 2, 0).to(torch.float16)
-                )
-            else:
-                loc_page = torch.div(loc, page_size, rounding_mode="floor")
-                loc_off = loc - loc_page * page_size
-                self._kernel.c_latent_buffer[loc_off, :, loc_page] = kv_latent.view(-1, self.kv_lora_rank).to(torch.float16)
-                self._kernel.c_rope_buffer[loc_off, :, loc_page] = k_rope.view(-1, self.qk_rope_head_dim).to(torch.float16)
 
             # Populate per-call kernel inputs and run in-place.
             max_blocks = int(block_table.shape[1])
             self._kernel.q_latent_buffer[:, :, :B].copy_(
-                q_latent.view(B, self.num_local_heads, self.kv_lora_rank).permute(1, 2, 0).to(torch.float16)
+                q_latent.view(B, self.num_local_heads, self.kv_lora_rank).permute(1, 2, 0)
             )
             self._kernel.q_rope_buffer[:, :, :B].copy_(
-                q_pe.view(B, self.num_local_heads, self.qk_rope_head_dim).permute(1, 2, 0).to(torch.float16)
+                q_pe.view(B, self.num_local_heads, self.qk_rope_head_dim).permute(1, 2, 0)
             )
-            self._kernel.page_table_buffer[:max_blocks, :B].copy_(block_table.T)
+            # Clamp to kernel KV capacity (see prefill path comment above).
+            max_blocks = min(max_blocks, int(self._kernel.page_table_buffer.shape[0]))
+            self._kernel.page_table_buffer[:max_blocks, :B].copy_(block_table.T[:max_blocks])
             self._kernel.cache_seqs_buffer[:B].copy_(cache_seqlens)
-            out_latent, _ = self._kernel.run_inplace(B, num_pages, float(self.softmax_scale))
+            # Clear stale entries beyond the current batch to avoid "phantom" slots
+            # left over from earlier calls with larger max_batch.
+            if int(B) < int(self._kernel.cache_seqs_buffer.numel()):
+                self._kernel.cache_seqs_buffer[int(B):].zero_()
+            out_latent, _ = self._kernel.run_inplace(B, float(self.softmax_scale))
 
             out_latent = out_latent.permute(2, 0, 1).view(B, S, self.num_local_heads, self.kv_lora_rank)
-            out = torch.einsum("bshc,hdc->bshd", out_latent.to(x.dtype), W[:, -self.v_head_dim:])
+            out = torch.einsum("bshc,hdc->bshd", out_latent, W[:, -self.v_head_dim:])
             return self.wo(out.flatten(2))
 
 
@@ -4590,6 +4704,9 @@ class _CompiledMlaKernel:
         max_seq_len: int,
         page_size: int,
         device: torch.device,
+        *,
+        c_latent: torch.Tensor,
+        c_rope: torch.Tensor,
     ):
         import cutlass.torch as ctorch
 
@@ -4644,19 +4761,44 @@ class _CompiledMlaKernel:
 
         # Q tensors: (H, D, B) with stride[1]=1
         self._q_latent_ct, self._q_latent_data = make_cute_tensor(
-            (num_heads, self.LATENT_DIM, max_batch), torch.float16, cutlass.Float16, 1)
+            (num_heads, self.LATENT_DIM, max_batch), torch.bfloat16, cutlass.BFloat16, 1)
         self._q_rope_ct, self._q_rope_data = make_cute_tensor(
-            (num_heads, self.ROPE_DIM, max_batch), torch.float16, cutlass.Float16, 1)
+            (num_heads, self.ROPE_DIM, max_batch), torch.bfloat16, cutlass.BFloat16, 1)
 
-        # KV cache: (max_pages, page_size, D) with stride[1]=1
-        # IMPORTANT: CuTeDSL Blackwell MLA expects the paged KV cache in the same layout
-        # as the upstream NVIDIA example: (page_size, D, num_pages) with D as the leading
-        # dimension (stride=1). Our engine stores KV as (num_pages, page_size, D), so we
-        # transpose when copying into these backing tensors.
-        self._c_latent_ct, self._c_latent_data = make_cute_tensor(
-            (page_size, self.LATENT_DIM, self.max_pages), torch.float16, cutlass.Float16, 1)
-        self._c_rope_ct, self._c_rope_data = make_cute_tensor(
-            (page_size, self.ROPE_DIM, self.max_pages), torch.float16, cutlass.Float16, 1)
+        # KV cache: external buffers (no staging copies).
+        #
+        # CuTeDSL Blackwell MLA expects KV in (page_size, D, num_pages) layout with
+        # D having unit stride. The engine allocates KV in this layout and MLA writes
+        # compressed KV directly into it.
+        _require(c_latent.is_cuda and c_rope.is_cuda, "CuTeDSL KV cache buffers must be CUDA tensors.")
+        _require(c_latent.dtype == torch.bfloat16 and c_rope.dtype == torch.bfloat16, "CuTeDSL KV cache buffers must be bf16.")
+        _require(
+            tuple(c_latent.shape) == (int(page_size), int(self.LATENT_DIM), int(self.max_pages)),
+            f"Expected c_latent shape {(int(page_size), int(self.LATENT_DIM), int(self.max_pages))}, got {tuple(c_latent.shape)}.",
+        )
+        _require(
+            tuple(c_rope.shape) == (int(page_size), int(self.ROPE_DIM), int(self.max_pages)),
+            f"Expected c_rope shape {(int(page_size), int(self.ROPE_DIM), int(self.max_pages))}, got {tuple(c_rope.shape)}.",
+        )
+        _require(int(c_latent.stride(1)) == 1 and int(c_rope.stride(1)) == 1, "CuTeDSL KV cache requires D stride=1.")
+        self._c_latent_data = c_latent
+        self._c_rope_data = c_rope
+
+        # Create CuTe tensors that alias the external torch buffers (no allocation, no copy).
+        self._c_latent_ct = from_dlpack(self._c_latent_data, assumed_align=16, use_32bit_stride=True).mark_layout_dynamic()
+        self._c_rope_ct = from_dlpack(self._c_rope_data, assumed_align=16, use_32bit_stride=True).mark_layout_dynamic()
+        # Mark compact shape dynamic (match make_cute_tensor behavior).
+        for ct, tt, cutlass_dtype in (
+            (self._c_latent_ct, self._c_latent_data, cutlass.BFloat16),
+            (self._c_rope_ct, self._c_rope_data, cutlass.BFloat16),
+        ):
+            strides = tt.stride()
+            stride_order = tuple(sorted(range(len(strides)), key=lambda i: strides[i], reverse=True))
+            ct.mark_compact_shape_dynamic(
+                mode=1,
+                stride_order=stride_order,
+                divisibility=(128 // cutlass_dtype.width),
+            )
 
         # Page table: (max_pages, B) with stride[0]=1, skip compact (NVIDIA example doesn't use it)
         self._page_table_ct, self._page_table_data = make_cute_tensor(
@@ -4664,7 +4806,7 @@ class _CompiledMlaKernel:
 
         # Output: (H, D, B) with stride[1]=1
         self._o_ct, self._o_data = make_cute_tensor(
-            (num_heads, self.LATENT_DIM, max_batch), torch.float16, cutlass.Float16, 1)
+            (num_heads, self.LATENT_DIM, max_batch), torch.bfloat16, cutlass.BFloat16, 1)
 
         # LSE: (H, B) with stride[0]=1, skip mark_compact_shape_dynamic
         self._lse_ct, self._lse_data = make_cute_tensor(
@@ -4687,8 +4829,6 @@ class _CompiledMlaKernel:
         self,
         q_latent: torch.Tensor,  # [H, 512, B]
         q_rope: torch.Tensor,    # [H, 64, B]
-        c_latent: torch.Tensor,  # [num_pages, page_size, 512]
-        c_rope: torch.Tensor,    # [num_pages, page_size, 64]
         page_table: torch.Tensor,  # [max_blocks, B] - block indices into cache
         cache_seqs: torch.Tensor,  # [B]
         softmax_scale: float,
@@ -4696,16 +4836,13 @@ class _CompiledMlaKernel:
         copy_out: bool = True,  # Set False to return views (caller must not modify)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B = cache_seqs.shape[0]
-        num_pages = c_latent.shape[0]  # (num_pages, page_size, D) in engine format
-        max_blocks = page_table.shape[0]
+        max_blocks = int(page_table.shape[0])
+        max_blocks = min(max_blocks, int(self._page_table_data.shape[0]))
 
         # Copy inputs to pre-allocated backing tensors
         self._q_latent_data[:, :, :B].copy_(q_latent)
         self._q_rope_data[:, :, :B].copy_(q_rope)
-        # Engine cache layout: (num_pages, page_size, D) -> kernel layout: (page_size, D, num_pages)
-        self._c_latent_data[:, :, :num_pages].copy_(c_latent.permute(1, 2, 0))
-        self._c_rope_data[:, :, :num_pages].copy_(c_rope.permute(1, 2, 0))
-        self._page_table_data[:max_blocks, :B].copy_(page_table)
+        self._page_table_data[:max_blocks, :B].copy_(page_table[:max_blocks, :B])
         self._cache_seqs_data[:B].copy_(cache_seqs)
 
         # Execute with pre-allocated cute tensors (use cached stream)
@@ -4733,14 +4870,12 @@ class _CompiledMlaKernel:
     def run_inplace(
         self,
         batch_size: int,
-        num_pages: int,
         softmax_scale: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Zero-copy execution - caller pre-populates backing tensors directly.
 
         For maximum performance, caller should:
-        1. Write inputs directly to: q_latent_buffer, q_rope_buffer, c_latent_buffer,
-           c_rope_buffer, page_table_buffer, cache_seqs_buffer
+        1. Write inputs directly to: q_latent_buffer, q_rope_buffer, page_table_buffer, cache_seqs_buffer
         2. Call this method
         3. Read output from: o_buffer, lse_buffer
 
@@ -4771,14 +4906,6 @@ class _CompiledMlaKernel:
         return self._q_rope_data
 
     @property
-    def c_latent_buffer(self) -> torch.Tensor:
-        return self._c_latent_data
-
-    @property
-    def c_rope_buffer(self) -> torch.Tensor:
-        return self._c_rope_data
-
-    @property
     def page_table_buffer(self) -> torch.Tensor:
         return self._page_table_data
 
@@ -4805,6 +4932,8 @@ class _CompiledMlaKernel:
             tuple(self.cluster_shape),
             int(self.max_active_clusters),
             int(self.split_kv),
+            self._q_latent_data.dtype,
+            self._o_data.dtype,
         )
         cached = _CompiledMlaKernel._COMPILED_CACHE.get(key)
         if cached is not None:

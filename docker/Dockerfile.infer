@@ -23,8 +23,9 @@ RUN rm -rf third_party/flashmla && \
 
 # Build FlashMLA (SM100 sparse kernels)
 RUN cd third_party/flashmla && \
+    . /workspace/nmoe/.venv/bin/activate && \
     FLASH_MLA_DISABLE_SM90=1 \
-    /workspace/nmoe/.venv/bin/python setup.py build_ext --inplace && \
+    python setup.py build_ext --inplace && \
     echo "✓ Built FlashMLA"
 
 # Clone and build DeepEP (intranode only, no NVSHMEM)
@@ -33,7 +34,8 @@ RUN git clone https://github.com/deepseek-ai/DeepEP.git third_party/DeepEP && \
     git submodule update --init --recursive && \
     rm -rf .git && \
     find . -name .git -o -name .gitmodules -exec rm -rf {} + && \
-    /workspace/nmoe/.venv/bin/python setup.py build_ext --inplace && \
+    . /workspace/nmoe/.venv/bin/activate && \
+    python setup.py build_ext --inplace && \
     echo "✓ Built DeepEP"
 
 # Clone and build DeepGEMM
@@ -42,7 +44,14 @@ RUN git clone https://github.com/deepseek-ai/DeepGEMM.git third_party/DeepGEMM &
     git submodule update --init --recursive && \
     rm -rf .git && \
     find . -name .git -o -name .gitmodules -exec rm -rf {} + && \
-    /workspace/nmoe/.venv/bin/python setup.py build_ext --inplace && \
+    # DeepGEMM JIT compiles with `-I deep_gemm/include` and includes `<cute/...>` / `<cutlass/...>`.
+    # Wire in submodule headers so NVCC JIT compilation succeeds in the container.
+    rm -rf deep_gemm/include/cute deep_gemm/include/cutlass && \
+    ln -s /workspace/nmoe/third_party/DeepGEMM/third-party/cutlass/include/cute deep_gemm/include/cute && \
+    ln -s /workspace/nmoe/third_party/DeepGEMM/third-party/cutlass/include/cutlass deep_gemm/include/cutlass && \
+    test -f deep_gemm/include/cute/container/tuple.hpp && \
+    . /workspace/nmoe/.venv/bin/activate && \
+    python setup.py build_ext --inplace && \
     echo "✓ Built DeepGEMM"
 
 # NCCL settings
@@ -60,4 +69,4 @@ COPY . /workspace/nmoe
 RUN . .venv/bin/activate && make -C nmoe/csrc
 
 # Python path (add inference deps)
-ENV PYTHONPATH=/workspace/nmoe:/workspace/nmoe/nmoe/csrc:/workspace/nmoe/third_party/flash_attn:/workspace/nmoe/third_party/DeepEP:/workspace/nmoe/third_party/DeepGEMM:/workspace/nmoe/third_party/flashmla:/workspace/nmoe/triton/python
+ENV PYTHONPATH=/workspace/nmoe:/workspace/nmoe/nmoe/csrc:/workspace/nmoe/third_party:/workspace/nmoe/third_party/DeepEP:/workspace/nmoe/third_party/DeepGEMM:/workspace/nmoe/third_party/flashmla:/workspace/nmoe/triton/python

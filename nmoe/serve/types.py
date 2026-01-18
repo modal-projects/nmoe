@@ -95,6 +95,14 @@ class Request:
   output_logprobs: list[float] = field(default_factory=list)
   output_topk: list[list[tuple[int, float]]] = field(default_factory=list)
   output_logits: Optional[torch.Tensor] = None  # [num_tokens, vocab_size]
+  # Internal accumulation for OutputMode.LOGITS (CPU tensors, stacked on finish).
+  _logits_chunks: list[torch.Tensor] = field(default_factory=list, repr=False)
+
+  # Optional teacher-forcing: when set, the orchestrator appends these tokens
+  # instead of sampling from the model. This is used for RL/distillation
+  # workflows that need logprobs of known target tokens under the serving path.
+  forced_output_ids: Optional[list[int]] = None
+  forced_output_pos: int = 0
 
   # KV cache tracking
   cached_len: int = 0       # Tokens already in KV cache (prefix hit)
@@ -105,6 +113,7 @@ class Request:
   # Lifecycle
   return_queue: Optional[asyncio.Queue] = None  # For streaming responses
   cancel_flag: bool = False
+  finish_reason: Optional[str] = None  # "stop" (EOS), "length" (max_tokens), "cancelled"
   metrics: RequestMetrics = field(default_factory=RequestMetrics)
 
   # Replica assignment (for disagg)
@@ -181,6 +190,10 @@ class Batch:
   block_table: Optional[torch.Tensor] = None  # [B,max_pages] int32 page ids (paged cache)
   cache_seqlens: Optional[torch.Tensor] = None  # [B] int32 cache lengths after this step
   cache_seqlens_cpu: Optional[list[int]] = None  # DSA only: CPU lengths (no GPU scalar reads)
+  # Table slot ids for each request (CUDA int64 [B]). This is a scheduling-time
+  # artifact used by the lockstep overlap path; it must remain a view into
+  # pre-allocated scheduler buffers (no per-step allocation).
+  table_idx: Optional[torch.Tensor] = None  # [B] int64
 
   # Attention metadata (backend-specific)
   attn_metadata: Optional[object] = None
@@ -217,9 +230,17 @@ class Batch:
 class ForwardOutput:
   """Output from engine forward pass."""
   logits: torch.Tensor  # [batch_size, vocab_size] or [total_tokens, vocab_size]
+  logits_cpu: Optional[torch.Tensor] = None  # [batch_size, vocab_size] on CPU (LOGITS mode)
   hidden_states: Optional[torch.Tensor] = None
 
   # For async token copy to CPU
   next_tokens_gpu: Optional[torch.Tensor] = None
   next_tokens_cpu: Optional[torch.Tensor] = None
+  moe_overflow_cpu: Optional[torch.Tensor] = None  # [1] int32 on CPU (dropped expert pairs)
+  next_logprobs_gpu: Optional[torch.Tensor] = None  # [batch_size] float32
+  next_logprobs_cpu: Optional[torch.Tensor] = None  # [batch_size] float32 on CPU
+  next_topk_ids_gpu: Optional[torch.Tensor] = None  # [batch_size, K] int32
+  next_topk_logprobs_gpu: Optional[torch.Tensor] = None  # [batch_size, K] float32
+  next_topk_ids_cpu: Optional[torch.Tensor] = None  # [batch_size, K] int32 on CPU
+  next_topk_logprobs_cpu: Optional[torch.Tensor] = None  # [batch_size, K] float32 on CPU
   copy_event: Optional[torch.cuda.Event] = None

@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Test V3-0324 text generation with MLA attention."""
+"""Test V3-0324 text generation with MLA attention.
+
+This test assumes TP=1 (EP-only): lm_head is replicated, so each rank has
+full-vocab logits and sampling is local (no vocab all-gather).
+"""
 
 import os
 from pathlib import Path
@@ -20,55 +24,22 @@ _maybe_set_cutlass_path()
 
 import torch
 import torch.distributed as dist
-from safetensors.torch import safe_open
 from transformers import AutoTokenizer
 
 
-def _all_gather_vocab_shards(local_logits: torch.Tensor, world_size: int) -> torch.Tensor:
-    if world_size == 1:
-        return local_logits
-    parts = [torch.empty_like(local_logits) for _ in range(world_size)]
-    dist.all_gather(parts, local_logits.contiguous())
-    return torch.cat(parts, dim=-1)
+def _greedy_argmax(logits: torch.Tensor) -> int:
+    """Greedy argmax over full vocab logits (TP=1 mode)."""
+    return int(torch.argmax(logits, dim=-1).item())
 
 
-def _tp_greedy_argmax(local_logits: torch.Tensor, vocab_size: int, rank: int, world_size: int) -> int:
-    """Greedy argmax over vocab-parallel shards, returning global token id."""
-    if world_size == 1:
-        return int(torch.argmax(local_logits, dim=-1).item())
-
-    v_shard = int(local_logits.numel())
-    if v_shard * world_size != int(vocab_size):
-        raise ValueError(f"Vocab sharding mismatch: {v_shard}*{world_size} != {vocab_size}")
-
-    start = rank * v_shard
-    local_max, local_idx = torch.max(local_logits, dim=-1)
-    local_gid = local_idx.to(torch.int64) + int(start)
-
-    gathered_vals = [torch.empty_like(local_max) for _ in range(world_size)]
-    gathered_gids = [torch.empty_like(local_gid) for _ in range(world_size)]
-    dist.all_gather(gathered_vals, local_max.contiguous())
-    dist.all_gather(gathered_gids, local_gid.contiguous())
-
-    vals = torch.stack(gathered_vals, dim=0)
-    gids = torch.stack(gathered_gids, dim=0)
-    gmax = torch.max(vals, dim=0).values
-
-    mask = vals == gmax.unsqueeze(0)
-    big = torch.full_like(gids, int(vocab_size) + 1)
-    candidates = torch.where(mask, gids, big)
-    return int(torch.min(candidates, dim=0).values.item())
-
-
-def load_mp8_checkpoint(model: torch.nn.Module, ckpt_path: str, rank: int, world_size: int):
-    """Load pre-converted mp8 checkpoint."""
-    fpath = os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors")
-    state_dict = {}
-    with safe_open(fpath, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            state_dict[key] = f.get_tensor(key)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    return missing, unexpected
+def _assert_all_ranks_equal(name: str, value: int, device: torch.device) -> None:
+    """Assert that all ranks computed the same integer value."""
+    t = torch.tensor([int(value)], dtype=torch.int64, device=device)
+    gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, t)
+    vals = [int(x.item()) for x in gathered]
+    if len(set(vals)) != 1:
+        raise RuntimeError(f"{name}: mismatch across ranks: {vals}")
 
 
 def main():
@@ -79,17 +50,17 @@ def main():
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
-    from nmoe.serve.model import ModelConfig, DeepSeekV3, init_distributed
+    from nmoe.serve.model import DeepSeekV3, init_distributed
+    from nmoe.serve.ckpt import load_checkpoint, load_model_config, load_sharded_checkpoint
     from deep_ep import Buffer
 
-    init_distributed(rank, world_size)
+    # TP=1 for EP-only dynamic disagg bringup.
+    init_distributed(rank, world_size, tp_size=1)
 
-    # V3-0324 config with MLA attention
-    cfg = ModelConfig(
-        num_layers=61,
-        num_dense_layers=3,
-        attention_type="mla",
-    )
+    ckpt_path = os.environ.get("NMOE_MODEL_PATH", "/data/models/DeepSeek-V3-0324-ep8-tp1")
+    cfg = load_model_config(ckpt_path)
+    if cfg.attention_type != "mla":
+        raise ValueError(f"Expected MLA checkpoint, got attention_type={cfg.attention_type!r}")
 
     if rank == 0:
         print("=" * 60)
@@ -110,13 +81,14 @@ def main():
     model = DeepSeekV3(cfg, buffer).to(device)
     model.eval()
 
-    # Load mp8 checkpoint
-    ckpt_path = "/data/models/DeepSeek-V3-0324-mp8"
-    hf_path = "/data/models/DeepSeek-V3-0324"  # For tokenizer
+    # Auto-detect sharded checkpoint format.
+    sharded_file = os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors")
     if rank == 0:
         print(f"\nLoading checkpoint from {ckpt_path}...")
-
-    missing, unexpected = load_mp8_checkpoint(model, ckpt_path, rank, world_size)
+    if os.path.exists(sharded_file):
+        missing, unexpected = load_sharded_checkpoint(model, ckpt_path, rank=rank, world_size=world_size)
+    else:
+        missing, unexpected = load_checkpoint(model, ckpt_path, rank=rank, world_size=world_size, cfg=cfg)
     if rank == 0:
         print(f"Loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
 
@@ -124,7 +96,7 @@ def main():
 
     # Load tokenizer from HF checkpoint
     if rank == 0:
-        tokenizer = AutoTokenizer.from_pretrained(hf_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(ckpt_path, trust_remote_code=True)
         prompts = [
             "The capital of France is",
             "2 + 2 =",
@@ -153,12 +125,13 @@ def main():
 
         # Setup MLA KV caches
         num_blocks = 8
+        page_size = 64
         kv_caches_latent = [
-            torch.zeros(num_blocks, 64, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device)
+            torch.zeros(num_blocks, page_size, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
             for _ in range(cfg.num_layers)
         ]
         kv_caches_rope = [
-            torch.zeros(num_blocks, 64, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device)
+            torch.zeros(num_blocks, page_size, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
             for _ in range(cfg.num_layers)
         ]
         block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).unsqueeze(0)
@@ -180,18 +153,10 @@ def main():
                 prefill_mode="dense",
             )
 
-        # Get next token from vocab-sharded logits
-        next_token = _tp_greedy_argmax(
-            logits[0, -1, :],
-            vocab_size=int(cfg.vocab_size),
-            rank=rank,
-            world_size=world_size,
-        )
-
-        # All ranks must participate in all_gather
-        full_last = _all_gather_vocab_shards(logits[0, -1, :], world_size)
+        next_token = _greedy_argmax(logits[0, -1, :])
+        _assert_all_ranks_equal("prefill_next_token", next_token, device)
         if rank == 0:
-            top5 = full_last.topk(5)
+            top5 = logits[0, -1, :].topk(5)
             print(f"\n{'='*60}")
             print(f"Prompt: '{prompt}'")
             print(f"Top5: {[tokenizer.decode([t]) for t in top5.indices.tolist()]}")
@@ -214,15 +179,11 @@ def main():
                     block_table=block_table,
                     cache_seqlens=cache_seqlens,
                     out_loc=out_loc_decode,
-                    prefill_mode="paged",  # Use paged path for decode (CuTeDSL decode kernel has issues)
+                    prefill_mode=None,  # decode
                 )
 
-            next_token = _tp_greedy_argmax(
-                logits[0, 0, :],
-                vocab_size=int(cfg.vocab_size),
-                rank=rank,
-                world_size=world_size,
-            )
+            next_token = _greedy_argmax(logits[0, 0, :])
+            _assert_all_ranks_equal("decode_next_token", next_token, device)
 
             if rank == 0:
                 generated.append(next_token)

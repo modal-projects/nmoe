@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, TYPE_CHECKING
+from typing import Literal, Optional, TYPE_CHECKING
 
 import torch
 
@@ -171,6 +171,42 @@ class Scheduler:
     self._starts_buffer = torch.zeros(
       config.max_batch_size, dtype=torch.int64, device=device
     )
+    # CPU pinned staging for scalar metadata to avoid per-element CUDA writes
+    # (which show up as at::indexing::set_item + tiny pageable H2D copies).
+    self._table_idx_cpu = torch.empty(
+      config.max_batch_size, dtype=torch.int64, device="cpu", pin_memory=True
+    )
+    self._starts_cpu = torch.empty(
+      config.max_batch_size, dtype=torch.int64, device="cpu", pin_memory=True
+    )
+
+    # GPU-resident last token per KV table slot (table_idx).
+    # This removes the decode dependency on Python lists (r.output_ids[-1]) and
+    # enables pipelining decode without waiting for D2H token copies.
+    self._last_token_by_table = torch.zeros(
+      (config.max_batch_size,), dtype=torch.int64, device=device
+    )
+
+  def set_last_token_for_req(self, req: Request, token: int) -> None:
+    """Initialize/update last token for a request's table slot (host-driven)."""
+    if int(req.table_idx) < 0:
+      raise RuntimeError("Request has no table_idx assigned.")
+    self._last_token_by_table[int(req.table_idx)] = int(token)
+
+  def update_last_tokens(self, table_idx: torch.Tensor, next_tokens: torch.Tensor) -> None:
+    """Update last-token table for a batch (GPU-driven, stream-ordered).
+
+    Args:
+      table_idx: [B] int64 CUDA tensor with table slots for each request.
+      next_tokens: [B] int64 CUDA tensor with sampled next tokens.
+    """
+    if table_idx.numel() == 0:
+      return
+    if table_idx.device != self.device or next_tokens.device != self.device:
+      raise RuntimeError("update_last_tokens expects CUDA tensors on scheduler.device.")
+    if table_idx.dtype != torch.int64 or next_tokens.dtype != torch.int64:
+      raise RuntimeError("update_last_tokens expects int64 tensors.")
+    self._last_token_by_table.index_copy_(0, table_idx, next_tokens)
 
   def add_request(self, req: Request) -> None:
     """Add a new request to the scheduler."""
@@ -188,17 +224,21 @@ class Scheduler:
       raise RuntimeError("No table slots available")
     req.table_idx = self._table_slots.pop()
 
-    # Check prefix cache
-    handle, cached_pages = self.kv_cache.match_prefix(req.input_ids)
-    req.cached_len = handle.cached_len
-    req.cache_handle = handle
-    self.kv_cache.lock(handle)
+    # Check prefix cache (profile-controlled)
+    if profile.prefix_cache != "disabled":
+      handle, cached_pages = self.kv_cache.match_prefix(req.input_ids)
+      req.cached_len = handle.cached_len
+      req.cache_handle = handle
+      self.kv_cache.lock(handle)
 
-    # Copy cached pages to page table
-    if len(cached_pages) > 0:
-      num_cached_pages = len(cached_pages)
-      self._page_table[req.table_idx, :num_cached_pages] = cached_pages
-      req.page_ids.extend([int(x) for x in cached_pages.tolist()])
+      # Copy cached pages to page table
+      if len(cached_pages) > 0:
+        num_cached_pages = len(cached_pages)
+        self._page_table[req.table_idx, :num_cached_pages] = cached_pages
+        req.page_ids.extend([int(x) for x in cached_pages.tolist()])
+    else:
+      req.cached_len = 0
+      req.cache_handle = None
 
     req.metrics.arrival_time = self._get_time()
 
@@ -279,13 +319,21 @@ class Scheduler:
     return self._prepare_batch(reqs, phase="prefill")
 
   def schedule_decode(self) -> Optional[Batch]:
-    """Schedule decode batch (all active decode requests)."""
+    """Schedule decode batch (up to max_batch_size active decode requests).
+
+    IMPORTANT: The batch size MUST NOT exceed max_batch_size. In DeepEP low-latency
+    mode, exceeding ll_max_dispatch_tokens_per_rank causes a capacity check failure
+    on one rank while others hang in DeepEP collectives (deadlock).
+    """
     if self._decode_queue.is_empty:
       return None
 
-    reqs = self._decode_queue.get_all()
-    if not reqs:
+    all_reqs = self._decode_queue.get_all()
+    if not all_reqs:
       return None
+
+    # Enforce max_batch_size to prevent DeepEP LL capacity overflow.
+    reqs = all_reqs[: self.config.max_batch_size]
 
     # Each decode step processes 1 token per request
     # Allocate new pages if needed
@@ -346,8 +394,67 @@ class Scheduler:
 
     return self.schedule_decode()
 
-  def finish_request(self, req: Request, success: bool = True) -> None:
-    """Mark request as finished and free resources."""
+  def has_pending_phase(self, phase: Literal["prefill", "decode"]) -> bool:
+    if phase == "prefill":
+      return self.has_pending_prefill
+    if phase == "decode":
+      return self.has_pending_decode
+    raise ValueError(f"Unknown phase: {phase}")
+
+  def schedule_phase(self, phase: Literal["prefill", "decode"]) -> Optional[Batch]:
+    """Schedule a batch for the requested phase, or None if no local work.
+
+    Note: In multi-rank lockstep mode, the orchestrator may call this even when
+    the global phase is active but this rank has no work. In that case, the
+    orchestrator must still participate in DeepEP collectives with T=0.
+    """
+    if phase == "prefill":
+      # FIXED batching profiles share the prefill phase; ensure they still make
+      # progress even if the orchestrator doesn't use schedule_next(profile).
+      if self._fixed_batch_reqs:
+        return self.schedule_fixed_batch()
+      return self.schedule_prefill()
+    if phase == "decode":
+      return self.schedule_decode()
+    raise ValueError(f"Unknown phase: {phase}")
+
+  def _release_request_resources(self, req: Request) -> None:
+    """Release KV pages / prefix-cache lock and return table slot."""
+    # Free table slot.
+    self._table_slots.append(req.table_idx)
+
+    profile = PROFILES.get(req.profile_name)
+    if profile is None:
+      raise ValueError(f"Unknown profile: {req.profile_name}")
+
+    # Return pages to allocator / prefix cache.
+    if req.page_ids:
+      pages = torch.tensor(req.page_ids, dtype=torch.int32, device="cpu")
+      if profile.prefix_cache != "disabled":
+        # Cache prompt-only (full pages) for future prefix hits. Never cache partial pages.
+        handle = req.cache_handle or CacheHandle(0, None)
+        prompt_cached = min(int(req.cached_len), int(req.input_ids.numel()))
+        self.kv_cache.insert_and_free(handle, req.input_ids[:prompt_cached], pages)
+      else:
+        # Prefix cache disabled: free all pages and release any prefix-cache lock.
+        self.kv_cache.free(pages)
+        if req.cache_handle is not None:
+          self.kv_cache.unlock(req.cache_handle)
+    else:
+      # No pages to return, but still release any prefix-cache lock.
+      if req.cache_handle is not None:
+        self.kv_cache.unlock(req.cache_handle)
+
+    req.cache_handle = None
+
+  def finish_request(self, req: Request, success: bool = True, *, defer_free: bool = False) -> None:
+    """Mark request as finished.
+
+    Args:
+      defer_free: If True, detach the request from scheduling but delay resource
+        release. This is required for the lockstep overlap path, where later
+        in-flight GPU steps may still touch this request's KV pages/table slot.
+    """
     req.mark_finished()
     if not success:
       req.status = RequestStatus.CANCELLED
@@ -355,22 +462,14 @@ class Scheduler:
     # Remove from decode queue if present
     self._decode_queue.remove(req)
 
-    # Free table slot
-    self._table_slots.append(req.table_idx)
+    if defer_free:
+      return
 
-    # Return pages to allocator / prefix cache.
-    if req.page_ids:
-      pages = torch.tensor(req.page_ids, dtype=torch.int32, device="cpu")
-      # Cache prompt-only (full pages) for future prefix hits. Never cache partial pages.
-      handle = req.cache_handle or CacheHandle(0, None)
-      prompt_cached = min(int(req.cached_len), int(req.input_ids.numel()))
-      self.kv_cache.insert_and_free(handle, req.input_ids[:prompt_cached], pages)
-    else:
-      # No pages to return, but still release any prefix-cache lock.
-      if req.cache_handle is not None:
-        self.kv_cache.unlock(req.cache_handle)
+    self._release_request_resources(req)
 
-    req.cache_handle = None
+  def release_finished_request(self, req: Request) -> None:
+    """Release resources for a request previously finished with defer_free=True."""
+    self._release_request_resources(req)
 
   def promote_to_decode(self, req: Request) -> None:
     """Move request from prefill to decode phase."""
@@ -406,6 +505,7 @@ class Scheduler:
         self._table_idx_buffer[i] = r.table_idx
       starts = self._starts_buffer[:B]
       table_idx = self._table_idx_buffer[:B]
+      batch.table_idx = table_idx
 
       # Positions: starts[:, None] + range[:S]
       token_pos = starts[:, None] + self._pos_range[:S]
@@ -427,23 +527,20 @@ class Scheduler:
       batch.cache_seqlens = torch.tensor(cache_seqlens_cpu, dtype=torch.int32, device=self.device)
 
     else:  # decode
-      # For decode, one token per request: the most recently appended token.
-      tokens = []
+      # For decode, one token per request: the most recently sampled token stored
+      # in the GPU last-token table (keyed by table_idx).
       positions = []
       for i, r in enumerate(reqs):
-        if r.output_ids:
-          tokens.append(int(r.output_ids[-1]))
-          positions.append(int(r.seq_len - 1))
-          self._table_idx_buffer[i] = r.table_idx
-        else:
-          raise RuntimeError("Decode request has no generated token.")
+        positions.append(int(r.seq_len - 1))
+        self._table_idx_buffer[i] = r.table_idx
 
-      token_t = torch.tensor(tokens, dtype=torch.int64, device=self.device)[:, None]
+      table_idx = self._table_idx_buffer[:B]
+      batch.table_idx = table_idx
+      token_t = torch.index_select(self._last_token_by_table, 0, table_idx)[:, None]
       pos_t = torch.tensor(positions, dtype=torch.int64, device=self.device)[:, None]
       batch.input_ids = token_t
       batch.positions = pos_t
 
-      table_idx = self._table_idx_buffer[:B]
       batch.block_table = self._page_table[table_idx]
       page_idx = torch.div(pos_t, self.config.page_size, rounding_mode="floor")
       off = pos_t % self.config.page_size
@@ -479,26 +576,30 @@ class Scheduler:
         chunk = r.input_ids[r.cached_len : r.cached_len + S]
         buf.input_ids_cpu[i, :S] = chunk
         # Metadata
-        self._starts_buffer[i] = r.cached_len
-        self._table_idx_buffer[i] = r.table_idx
+        self._starts_cpu[i] = int(r.cached_len)
+        self._table_idx_cpu[i] = int(r.table_idx)
         buf.cache_seqlens_cpu[i] = r.cached_len + S
 
+      # Non-blocking copies to GPU (pinned CPU -> device)
+      self._starts_buffer[:B].copy_(self._starts_cpu[:B], non_blocking=True)
+      self._table_idx_buffer[:B].copy_(self._table_idx_cpu[:B], non_blocking=True)
       # Non-blocking copy to GPU
       buf.input_ids[:B, :S].copy_(buf.input_ids_cpu[:B, :S], non_blocking=True)
 
       # Positions using pre-allocated range
       starts = self._starts_buffer[:B]
-      buf.positions[:B, :S] = starts[:, None] + self._pos_range[:S]
+      torch.add(starts[:, None], self._pos_range[:S], out=buf.positions[:B, :S])
 
       # Block table and out_loc
       table_idx = self._table_idx_buffer[:B]
+      batch.table_idx = table_idx
       buf.block_table[:B].copy_(self._page_table[table_idx])
 
       positions = buf.positions[:B, :S]
       page_idx = torch.div(positions, self.config.page_size, rounding_mode="floor")
       off = positions % self.config.page_size
       page_ids = self._page_table[table_idx[:, None], page_idx]
-      buf.out_loc[:B, :S] = (page_ids * self.config.page_size + off).to(torch.int32)
+      buf.out_loc[:B, :S].copy_((page_ids * self.config.page_size + off).to(torch.int32))
 
       # Cache seqlens - direct copy from pinned CPU (no .to() allocation)
       buf.cache_seqlens[:B].copy_(buf.cache_seqlens_cpu[:B], non_blocking=True)
@@ -515,29 +616,31 @@ class Scheduler:
 
     else:  # decode (S=1)
       for i, r in enumerate(reqs):
-        if not r.output_ids:
-          raise RuntimeError("Decode request has no generated token.")
-        buf.input_ids_cpu[i, 0] = r.output_ids[-1]
         pos = r.seq_len - 1
         buf.cache_seqlens_cpu[i] = r.cached_len + 1
-        self._starts_buffer[i] = pos  # reuse as position buffer
-        self._table_idx_buffer[i] = r.table_idx
+        self._starts_cpu[i] = int(pos)  # reuse as position buffer
+        self._table_idx_cpu[i] = int(r.table_idx)
 
-      # Non-blocking copies from pinned memory
-      buf.input_ids[:B, :1].copy_(buf.input_ids_cpu[:B, :1], non_blocking=True)
+      # Non-blocking copies to GPU (pinned CPU -> device)
+      self._starts_buffer[:B].copy_(self._starts_cpu[:B], non_blocking=True)
+      self._table_idx_buffer[:B].copy_(self._table_idx_cpu[:B], non_blocking=True)
+
+      # Decode token ids from GPU last-token table (no CPU staging).
+      table_idx = self._table_idx_buffer[:B]
+      batch.table_idx = table_idx
+      torch.index_select(self._last_token_by_table, 0, table_idx, out=buf.input_ids[:B, 0])
 
       # Positions
-      buf.positions[:B, 0] = self._starts_buffer[:B]
+      buf.positions[:B, 0].copy_(self._starts_buffer[:B])
 
       # Block table and out_loc
-      table_idx = self._table_idx_buffer[:B]
       buf.block_table[:B].copy_(self._page_table[table_idx])
 
       positions = buf.positions[:B, :1]
       page_idx = torch.div(positions, self.config.page_size, rounding_mode="floor")
       off = positions % self.config.page_size
       page_ids = self._page_table[table_idx[:, None], page_idx]
-      buf.out_loc[:B, :1] = (page_ids * self.config.page_size + off).to(torch.int32)
+      buf.out_loc[:B, :1].copy_((page_ids * self.config.page_size + off).to(torch.int32))
 
       # Cache seqlens - direct copy from pinned CPU
       buf.cache_seqlens[:B].copy_(buf.cache_seqlens_cpu[:B], non_blocking=True)

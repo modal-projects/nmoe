@@ -58,45 +58,19 @@ def main():
     print(f"Shared Experts Weight Check (world_size={world_size})")
     print("=" * 60)
 
-  # Print weight shapes and scale shapes
-  w1_shape = shared.w1.weight.shape
-  w1_scale_shape = shared.w1.weight_scale_inv.shape
-  w2_shape = shared.w2.weight.shape
-  w2_scale_shape = shared.w2.weight_scale_inv.shape
-  w3_shape = shared.w3.weight.shape
-  w3_scale_shape = shared.w3.weight_scale_inv.shape
-
+  # Shared experts are converted to BF16 fused weights at load time.
+  w13_shape = tuple(shared.w13_bf16.shape)  # [2*inter, hidden]
+  w2_shape = tuple(shared.w2_bf16.shape)    # [hidden, inter]
   if rank == 0:
-    print(f"\nw1 (gate): weight={w1_shape}, scale={w1_scale_shape}")
-    print(f"w2 (down): weight={w2_shape}, scale={w2_scale_shape}")
-    print(f"w3 (up):   weight={w3_shape}, scale={w3_scale_shape}")
+    print(f"\nshared.w13_bf16: {w13_shape} dtype={shared.w13_bf16.dtype}")
+    print(f"shared.w2_bf16:  {w2_shape} dtype={shared.w2_bf16.dtype}")
 
-    # Expected shapes for world_size=8:
-    # w1: [2048//8, 7168] = [256, 7168], scale: [2, 56]
-    # w2: [7168, 2048//8] = [7168, 256], scale: [56, 2]
-    # w3: [2048//8, 7168] = [256, 7168], scale: [2, 56]
-    print(f"\nExpected for world_size={world_size}:")
-    print(f"w1 (gate): weight=[{2048//world_size}, 7168], scale=[{(2048//world_size)//128}, 56]")
-    print(f"w2 (down): weight=[7168, {2048//world_size}], scale=[56, {(2048//world_size)//128}]")
-    print(f"w3 (up):   weight=[{2048//world_size}, 7168], scale=[{(2048//world_size)//128}, 56]")
-
-  # Gather all ranks' scales
-  w1_scale_mean = shared.w1.weight_scale_inv.float().mean()
-  all_w1_scale_means = [torch.empty_like(w1_scale_mean) for _ in range(world_size)]
-  dist.all_gather(all_w1_scale_means, w1_scale_mean.contiguous())
-
+  # Sanity: replicated weights should match across ranks (compare means).
+  w13_mean = shared.w13_bf16.float().mean()
+  all_w13_mean = [torch.empty_like(w13_mean) for _ in range(world_size)]
+  dist.all_gather(all_w13_mean, w13_mean.contiguous())
   if rank == 0:
-    print(f"\nw1 scale mean across ranks: {[f'{m:.6f}' for m in all_w1_scale_means]}")
-
-  # Compare first block of scales
-  w1_scale_first = shared.w1.weight_scale_inv[0, :5].float()
-  all_w1_scale_first = [torch.empty_like(w1_scale_first) for _ in range(world_size)]
-  dist.all_gather(all_w1_scale_first, w1_scale_first.contiguous())
-
-  if rank == 0:
-    print(f"\nw1 scale[0, :5] for each rank:")
-    for r, s in enumerate(all_w1_scale_first):
-      print(f"  Rank {r}: {s.tolist()}")
+    print(f"\nshared.w13_bf16 mean across ranks: {[f'{m:.6f}' for m in all_w13_mean]}")
 
   # Check if scales are from different parts of the full scale tensor
   # For correct sharding, rank 0 should have rows 0-1, rank 1 should have rows 2-3, etc.

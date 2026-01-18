@@ -84,12 +84,13 @@ def test_mla_e2e():
     num_blocks = (S + 64) // page_size + 2
 
     # KV caches
+    kv_page_size = int(page_size)
     kv_caches_latent = [
-        torch.zeros(num_blocks, page_size, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device)
+        torch.zeros(num_blocks, kv_page_size, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
         for _ in range(cfg.num_layers)
     ]
     kv_caches_rope = [
-        torch.zeros(num_blocks, page_size, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device)
+        torch.zeros(num_blocks, kv_page_size, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
         for _ in range(cfg.num_layers)
     ]
 

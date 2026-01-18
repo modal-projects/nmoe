@@ -68,6 +68,48 @@ def _cache_key(dtype: torch.dtype, device: torch.device, shape: tuple[int, ...])
   return (str(device), str(dtype), shape)
 
 
+def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+  """Dequantize FP8 weights using block-wise scales.
+
+  Naive torch implementation of DeepSeek's kernel.weight_dequant triton kernel.
+
+  Args:
+    x: FP8 weight tensor [M, N]
+    s: Scale tensor [M // block_size, N // block_size]
+    block_size: Block size for quantization (default 128)
+
+  Returns:
+    Dequantized weight tensor in default dtype [M, N]
+  """
+  if not x.is_contiguous():
+    x = x.contiguous()
+  if not s.is_contiguous():
+    s = s.contiguous()
+  assert x.dim() == 2 and s.dim() == 2, "weight_dequant expects 2D tensors"
+
+  M, N = x.size()
+  m_blocks = (M + block_size - 1) // block_size
+  n_blocks = (N + block_size - 1) // block_size
+
+  # Pad if necessary
+  M_pad = m_blocks * block_size
+  N_pad = n_blocks * block_size
+  if M_pad != M or N_pad != N:
+    x_pad = torch.zeros((M_pad, N_pad), device=x.device, dtype=x.dtype)
+    x_pad[:M, :N].copy_(x)
+    x = x_pad
+
+  # Reshape to blocks: [m_blocks, block_size, n_blocks, block_size]
+  x_blocked = x.view(m_blocks, block_size, n_blocks, block_size).float()
+  # Scale is [m_blocks, n_blocks], expand to match
+  s_expanded = s.view(m_blocks, 1, n_blocks, 1).float()
+  # Dequantize
+  y = x_blocked * s_expanded
+  # Reshape back
+  y = y.view(M_pad, N_pad)[:M, :N]
+  return y.to(torch.get_default_dtype())
+
+
 def fp8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor) -> torch.Tensor:
   if not a.is_contiguous():
     a = a.contiguous()

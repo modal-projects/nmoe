@@ -82,11 +82,11 @@ def benchmark_prefill(model, cfg, device, rank, world_size, attention_type: str)
             kv_caches = None
             idx_k_caches = None
             kv_caches_latent = [
-                torch.zeros(total_blocks, page_size, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device)
+                torch.zeros(total_blocks, page_size, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
                 for _ in range(cfg.num_layers)
             ]
             kv_caches_rope = [
-                torch.zeros(total_blocks, page_size, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device)
+                torch.zeros(total_blocks, page_size, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
                 for _ in range(cfg.num_layers)
             ]
 

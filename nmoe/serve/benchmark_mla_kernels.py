@@ -59,6 +59,10 @@ def benchmark_cutedsl_mla(config: BenchmarkConfig, device: torch.device, use_zer
         t = torch.randn(reordered, dtype=dtype, device=device) * 0.1
         return t.permute(*inv_perm)
 
+    # KV cache (CuTeDSL layout): (page_size, D, num_pages) with D having unit stride.
+    c_latent = make_tensor((page_size, L, num_pages), torch.bfloat16, 1)
+    c_rope = make_tensor((page_size, R, num_pages), torch.bfloat16, 1)
+
     # Create kernel (compiles during init)
     compile_start = time.perf_counter()
     kernel = _CompiledMlaKernel(
@@ -67,6 +71,8 @@ def benchmark_cutedsl_mla(config: BenchmarkConfig, device: torch.device, use_zer
         max_seq_len=seq_len,
         page_size=page_size,
         device=device,
+        c_latent=c_latent,
+        c_rope=c_rope,
     )
     compile_time = time.perf_counter() - compile_start
 
@@ -74,10 +80,8 @@ def benchmark_cutedsl_mla(config: BenchmarkConfig, device: torch.device, use_zer
 
     if use_zero_copy:
         # Zero-copy path: pre-populate kernel's backing tensors once
-        q_latent = make_tensor((H, L, B), torch.float16, 1)
-        q_rope = make_tensor((H, R, B), torch.float16, 1)
-        c_latent = make_tensor((num_pages, page_size, L), torch.float16, 1)
-        c_rope = make_tensor((num_pages, page_size, R), torch.float16, 1)
+        q_latent = make_tensor((H, L, B), torch.bfloat16, 1)
+        q_rope = make_tensor((H, R, B), torch.bfloat16, 1)
         page_table = torch.empty(B, num_pages, dtype=torch.int32, device=device)
         for i in range(num_pages):
             page_table[:, i] = i
@@ -87,29 +91,25 @@ def benchmark_cutedsl_mla(config: BenchmarkConfig, device: torch.device, use_zer
         # Pre-populate backing tensors
         kernel.q_latent_buffer[:, :, :B].copy_(q_latent)
         kernel.q_rope_buffer[:, :, :B].copy_(q_rope)
-        kernel.c_latent_buffer[:num_pages].copy_(c_latent)
-        kernel.c_rope_buffer[:num_pages].copy_(c_rope)
         kernel.page_table_buffer[:num_pages, :B].copy_(page_table)
         kernel.cache_seqs_buffer[:B].copy_(cache_seqs)
 
         # Warmup
         for _ in range(config.warmup_iters):
-            out, lse = kernel.run_inplace(B, num_pages, softmax_scale)
+            out, lse = kernel.run_inplace(B, softmax_scale)
         torch.cuda.synchronize()
 
         # Benchmark
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(config.bench_iters):
-            out, lse = kernel.run_inplace(B, num_pages, softmax_scale)
+            out, lse = kernel.run_inplace(B, softmax_scale)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
     else:
         # Standard path with copies
-        q_latent = make_tensor((H, L, B), torch.float16, 1)
-        q_rope = make_tensor((H, R, B), torch.float16, 1)
-        c_latent = make_tensor((num_pages, page_size, L), torch.float16, 1)
-        c_rope = make_tensor((num_pages, page_size, R), torch.float16, 1)
+        q_latent = make_tensor((H, L, B), torch.bfloat16, 1)
+        q_rope = make_tensor((H, R, B), torch.bfloat16, 1)
         page_table = torch.empty(B, num_pages, dtype=torch.int32, device=device)
         for i in range(num_pages):
             page_table[:, i] = i
@@ -118,14 +118,14 @@ def benchmark_cutedsl_mla(config: BenchmarkConfig, device: torch.device, use_zer
 
         # Warmup
         for _ in range(config.warmup_iters):
-            out, lse = kernel(q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, softmax_scale)
+            out, lse = kernel(q_latent, q_rope, page_table, cache_seqs, softmax_scale)
         torch.cuda.synchronize()
 
         # Benchmark
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(config.bench_iters):
-            out, lse = kernel(q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, softmax_scale)
+            out, lse = kernel(q_latent, q_rope, page_table, cache_seqs, softmax_scale)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
 
@@ -133,7 +133,7 @@ def benchmark_cutedsl_mla(config: BenchmarkConfig, device: torch.device, use_zer
 
     # Memory stats
     torch.cuda.reset_peak_memory_stats()
-    out, lse = kernel.run_inplace(B, num_pages, softmax_scale)
+    out, lse = kernel.run_inplace(B, softmax_scale)
     torch.cuda.synchronize()
     peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 

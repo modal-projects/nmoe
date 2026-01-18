@@ -10,13 +10,16 @@ Requirements:
     torchrun --nproc_per_node=8 -m nmoe.serve.test_correctness_reference
 
 Configuration (required via env):
-- NMOE_MODEL_PATH: HF checkpoint dir (e.g. /data/models/DeepSeek-V3.2-Speciale)
+- NMOE_MODEL_PATH: reference HF checkpoint dir (e.g. /data/models/DeepSeek-V3.2-Speciale)
+- NMOE_OUR_MODEL_PATH: nmoe EP8-TP1 dir (e.g. /data/models/DeepSeek-V3.2-Speciale-ep8-tp1)
 - NMOE_REFERENCE_DIR: reference python dir (e.g. $NMOE_MODEL_PATH/inference)
 - NMOE_REFERENCE_CONFIG: reference json (e.g. $NMOE_REFERENCE_DIR/config_671B_v3.2.json)
 - NMOE_REFERENCE_MP_DIR: mp8 shard dir (e.g. /data/models/DeepSeek-V3.2-Speciale-mp8)
 
 Optional:
 - NMOE_REFERENCE_MAX_INPUTS: limit number of test inputs (default: 2)
+- NMOE_REFERENCE_PHASE: auto|reference|compare (default: auto)
+- NMOE_REFERENCE_LOGITS_PATH: where rank0 saves reference logits (default: /tmp/nmoe_reference_logits.pt)
 """
 
 from __future__ import annotations
@@ -37,7 +40,8 @@ import torch.distributed as dist
 
 @dataclass(frozen=True)
 class _Paths:
-  model_path: str
+  reference_model_path: str
+  our_model_path: str
   reference_dir: str
   reference_config: str
   reference_mp_dir: str
@@ -51,12 +55,14 @@ def _require_env(name: str) -> str:
 
 
 def _paths() -> _Paths:
-  model_path = _require_env("NMOE_MODEL_PATH")
-  reference_dir = os.environ.get("NMOE_REFERENCE_DIR", f"{model_path}/inference").strip()
+  reference_model_path = _require_env("NMOE_MODEL_PATH")
+  our_model_path = _require_env("NMOE_OUR_MODEL_PATH")
+  reference_dir = os.environ.get("NMOE_REFERENCE_DIR", f"{reference_model_path}/inference").strip()
   reference_config = os.environ.get("NMOE_REFERENCE_CONFIG", f"{reference_dir}/config_671B_v3.2.json").strip()
   reference_mp_dir = _require_env("NMOE_REFERENCE_MP_DIR")
   return _Paths(
-    model_path=model_path,
+    reference_model_path=reference_model_path,
+    our_model_path=our_model_path,
     reference_dir=reference_dir,
     reference_config=reference_config,
     reference_mp_dir=reference_mp_dir,
@@ -168,30 +174,40 @@ def _run_reference_logits_last(tokens: torch.Tensor, *, paths: _Paths, rank: int
 
 def _run_our_logits_last(tokens: torch.Tensor, *, paths: _Paths, rank: int, world_size: int) -> torch.Tensor:
   _maybe_set_cutlass_path()
-  from deep_ep import Buffer
-  from nmoe.serve.ckpt import load_checkpoint
-  from nmoe.serve.model import DeepSeekV3, ModelConfig, init_distributed
+  mode = os.environ.get("NMOE_EP_TRANSPORT", "rdep").strip().lower()
+  if mode != "rdep":
+    raise RuntimeError(f"test_correctness_reference requires NMOE_EP_TRANSPORT=rdep (got {mode!r})")
 
-  init_distributed(rank, world_size)
-  cfg = ModelConfig(num_layers=61, num_dense_layers=3)
+  # Use a shared per-run extensions dir across ranks to avoid JIT skew causing
+  # barrier/collective timeouts.
+  master_port = os.environ.get("MASTER_PORT", "0")
+  os.environ.setdefault("TORCH_EXTENSIONS_DIR", f"/tmp/torch_extensions_nmoe_{master_port}")
+  os.makedirs(os.environ["TORCH_EXTENSIONS_DIR"], exist_ok=True)
 
-  # Minimal DeepEP buffer (we only need local single-node comm).
-  hidden_bytes = cfg.hidden_size * 2  # bf16
-  dispatch_config = Buffer.get_dispatch_config(world_size)
-  combine_config = Buffer.get_combine_config(world_size)
-  num_nvl_bytes = max(
-    dispatch_config.get_nvl_buffer_size_hint(hidden_bytes, world_size),
-    combine_config.get_nvl_buffer_size_hint(hidden_bytes, world_size),
-  )
-  buffer = Buffer(group=dist.group.WORLD, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=0)
+  from nmoe.serve.ckpt import load_checkpoint, load_model_config
+  from nmoe.serve.engine import Engine, EngineConfig
 
   device = torch.device(f"cuda:{rank}")
-  model = DeepSeekV3(cfg, buffer).to(device).eval()
+  cfg = load_model_config(paths.our_model_path)
+  engine_cfg = EngineConfig(
+    # Keep all allocations minimal: this test only runs short prefill (S~8).
+    num_pages=8,
+    page_size=64,
+    num_layers=int(cfg.num_layers),
+    kv_lora_rank=int(getattr(cfg, "kv_lora_rank", 0)),
+    qk_rope_head_dim=int(getattr(cfg, "qk_rope_head_dim", 0)),
+    max_batch_size=32,
+    max_seq_len=512,
+    max_step_tokens=256,
+    attention_type=str(getattr(cfg, "attention_type", "dsa")),
+    idx_dim=int(getattr(cfg, "dsa_idx_dim", 128)),
+    tp_size=1,
+  )
+  engine = Engine(cfg, engine_cfg, rank=rank, world_size=world_size)
 
-  missing, unexpected = load_checkpoint(model, paths.model_path, rank=rank, world_size=world_size, cfg=cfg)
+  missing, unexpected = load_checkpoint(engine.model, paths.our_model_path, rank=rank, world_size=world_size, cfg=cfg)
   if missing:
     raise RuntimeError(f"load_checkpoint missing keys: {sorted(missing)[:10]}")
-  # Unexpected is allowed (e.g., layers.61 MTP).
 
   B, S = tokens.shape
   positions = torch.arange(S, device=device, dtype=torch.int64).unsqueeze(0).expand(B, -1)
@@ -209,7 +225,7 @@ def _run_our_logits_last(tokens: torch.Tensor, *, paths: _Paths, rank: int, worl
   cache_seqlens = torch.full((B,), S, device=device, dtype=torch.int32)
 
   with torch.inference_mode():
-    logits = model(
+    logits = engine.model(
       tokens.to(device),
       positions,
       kv_caches=kv_caches,
@@ -218,6 +234,10 @@ def _run_our_logits_last(tokens: torch.Tensor, *, paths: _Paths, rank: int, worl
       cache_seqlens=cache_seqlens,
       cache_seqlens_cpu=[int(S)] * int(B),
       out_loc=out_loc,
+      # Reference forward is a prefill over S>1 tokens; ensure we do not take
+      # the decode (low-latency) MoE dispatch path, which assumes decode-like
+      # shapes and can trip DeepEP invariants.
+      prefill_mode="dense",
     )
   return logits[:, -1, :].float().cpu()
 
@@ -232,34 +252,70 @@ class TestCorrectnessReference(unittest.TestCase):
     if world_size != 8:
       raise unittest.SkipTest(f"requires world_size=8 for mp8 reference (got {world_size})")
 
+    mode = os.environ.get("NMOE_EP_TRANSPORT", "rdep").strip().lower()
+    if mode != "rdep":
+      raise RuntimeError(f"test_correctness_reference requires NMOE_EP_TRANSPORT=rdep (got {mode!r})")
+
     # Deterministic token inputs (avoid tokenizer/template confounders).
     test_inputs: List[List[int]] = [
       [1, 100, 1000, 10000, 50000, 60000, 1234, 5678],
     ]
 
-    ref_logits_all: List[torch.Tensor] = []
-    our_logits_all: List[torch.Tensor] = []
+    out_path = os.environ.get("NMOE_REFERENCE_LOGITS_PATH", "/tmp/nmoe_reference_logits.pt")
+    phase_env = os.environ.get("NMOE_REFERENCE_PHASE", "auto").strip().lower()
+    if phase_env not in ("auto", "reference", "compare"):
+      raise ValueError(f"Invalid NMOE_REFERENCE_PHASE={phase_env!r}; expected auto|reference|compare")
+    if phase_env == "auto":
+      phase = "compare" if os.path.exists(out_path) else "reference"
+    else:
+      phase = phase_env
 
-    # Run reference first (naive torch kernel), then our model.
+    if phase == "reference":
+      ref_logits_all: List[torch.Tensor] = []
+      for ids in test_inputs:
+        tokens = torch.tensor([ids], dtype=torch.long, device=f"cuda:{rank}")
+        ref_logits_all.append(_run_reference_logits_last(tokens, paths=paths, rank=rank, world_size=world_size))
+        gc.collect()
+        torch.cuda.empty_cache()
+
+      if rank == 0:
+        payload = {"test_inputs": test_inputs, "ref_last_logits": ref_logits_all}
+        torch.save(payload, out_path)
+        print(f"[reference] saved logits to: {out_path}", flush=True)
+      return
+
+    # compare
+    if not os.path.exists(out_path):
+      raise RuntimeError(
+        f"[compare] missing reference logits: {out_path}. "
+        f"Run with NMOE_REFERENCE_PHASE=reference first."
+      )
+    payload = torch.load(out_path, map_location="cpu")
+    saved_inputs = payload.get("test_inputs")
+    ref_logits_all = payload.get("ref_last_logits")
+    if not isinstance(saved_inputs, list) or not isinstance(ref_logits_all, list):
+      raise RuntimeError(f"[compare] invalid payload in {out_path}")
+    if saved_inputs != test_inputs:
+      raise RuntimeError(f"[compare] payload inputs differ from test inputs (payload={saved_inputs}, test={test_inputs})")
+
+    our_logits_all: List[torch.Tensor] = []
     for ids in test_inputs:
       tokens = torch.tensor([ids], dtype=torch.long, device=f"cuda:{rank}")
-      ref_logits_all.append(_run_reference_logits_last(tokens, paths=paths, rank=rank, world_size=world_size))
-      gc.collect()
-      torch.cuda.empty_cache()
-
       our_logits_all.append(_run_our_logits_last(tokens, paths=paths, rank=rank, world_size=world_size))
       gc.collect()
       torch.cuda.empty_cache()
 
     if rank == 0:
-      out_path = os.environ.get("NMOE_REFERENCE_LOGITS_PATH", "/tmp/nmoe_reference_logits.pt")
-      payload = {
-        "test_inputs": test_inputs,
-        "ref_last_logits": ref_logits_all,
-        "our_last_logits": our_logits_all,
-      }
-      torch.save(payload, out_path)
-
+      # Save both sides for debugging (large but actionable).
+      out_debug = os.environ.get("NMOE_REFERENCE_COMPARE_DUMP", "/tmp/nmoe_compare_logits.pt")
+      torch.save(
+        {
+          "test_inputs": test_inputs,
+          "ref_last_logits": ref_logits_all,
+          "our_last_logits": our_logits_all,
+        },
+        out_debug,
+      )
       for i, (ref, ours) in enumerate(zip(ref_logits_all, our_logits_all)):
         self.assertEqual(tuple(ref.shape), tuple(ours.shape), f"shape mismatch on input_{i}: {ref.shape} vs {ours.shape}")
         ref_argmax = int(ref[0].argmax().item())
@@ -267,17 +323,26 @@ class TestCorrectnessReference(unittest.TestCase):
         if ref_argmax != our_argmax:
           ref_top5 = ref[0].topk(5).indices.tolist()
           our_top5 = ours[0].topk(5).indices.tolist()
+          max_abs = float((ref - ours).abs().max().item())
+          mean_abs = float((ref - ours).abs().mean().item())
           raise AssertionError(
             f"argmax mismatch on input_{i}: ref={ref_argmax} ours={our_argmax}\n"
             f"  ref_top5={ref_top5}\n"
             f"  our_top5={our_top5}\n"
-            f"  saved_logits={out_path}"
+            f"  max_abs_diff={max_abs:.6f} mean_abs_diff={mean_abs:.6f}\n"
+            f"  reference_logits={out_path}\n"
+            f"  compare_dump={out_debug}"
           )
 
 
 def main() -> int:
   suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestCorrectnessReference)
   result = unittest.TextTestRunner(verbosity=2).run(suite)
+  try:
+    if dist.is_initialized():
+      dist.destroy_process_group()
+  except Exception:
+    pass
   return 0 if result.wasSuccessful() else 1
 
 

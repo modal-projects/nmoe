@@ -90,9 +90,11 @@ def test_mla_standalone():
     # Random test data (all ranks same seed for debugging)
     torch.manual_seed(42)
 
-    # KV caches
-    kv_cache_latent = torch.zeros(num_pages, page_size, latent_dim, dtype=torch.bfloat16, device=device)
-    kv_cache_rope = torch.zeros(num_pages, page_size, rope_dim, dtype=torch.bfloat16, device=device)
+    # KV caches (CuTeDSL layout): (page_size, D, num_pages) with D stride=1.
+    kv_cache_latent_base = torch.zeros(num_pages, page_size, latent_dim, dtype=torch.bfloat16, device=device)
+    kv_cache_rope_base = torch.zeros(num_pages, page_size, rope_dim, dtype=torch.bfloat16, device=device)
+    kv_cache_latent = kv_cache_latent_base.permute(1, 2, 0)
+    kv_cache_rope = kv_cache_rope_base.permute(1, 2, 0)
 
     # Create random absorbed Q and KV for testing (bypass model projections)
     # This tests the kernel directly
@@ -105,8 +107,8 @@ def test_mla_standalone():
     for i in range(S_prefill):
         page_idx = i // page_size
         offset = i % page_size
-        kv_cache_latent[page_idx, offset] = kv_latent_prefill[0, i]
-        kv_cache_rope[page_idx, offset] = k_rope_prefill[0, i]
+        kv_cache_latent_base[offset, page_idx] = kv_latent_prefill[0, i]
+        kv_cache_rope_base[offset, page_idx] = k_rope_prefill[0, i]
 
     # === TEST 1: PyTorch reference for prefill ===
     if rank == 0:
@@ -138,8 +140,8 @@ def test_mla_standalone():
     decode_pos = S_prefill
     page_idx = decode_pos // page_size
     offset = decode_pos % page_size
-    kv_cache_latent[page_idx, offset] = kv_latent_decode[0, 0]
-    kv_cache_rope[page_idx, offset] = k_rope_decode[0, 0]
+    kv_cache_latent_base[offset, page_idx] = kv_latent_decode[0, 0]
+    kv_cache_rope_base[offset, page_idx] = k_rope_decode[0, 0]
 
     # Setup CuTe kernel
     kernel = _CompiledMlaKernel(
@@ -148,6 +150,8 @@ def test_mla_standalone():
         max_seq_len=num_pages * page_size,
         page_size=page_size,
         device=device,
+        c_latent=kv_cache_latent,
+        c_rope=kv_cache_rope,
     )
 
     # Block table and seqlens
@@ -155,19 +159,11 @@ def test_mla_standalone():
     cache_seqlens = torch.tensor([decode_pos + 1], dtype=torch.int32, device=device)  # Attend to 0..S_prefill
 
     # Prepare kernel inputs
-    q_latent_k = q_latent_decode.view(B, H, latent_dim).permute(1, 2, 0).contiguous().half()  # [H, L, B]
-    q_pe_k = q_pe_decode.view(B, H, rope_dim).permute(1, 2, 0).contiguous().half()  # [H, R, B]
+    q_latent_k = q_latent_decode.view(B, H, latent_dim).permute(1, 2, 0)  # [H, L, B]
+    q_pe_k = q_pe_decode.view(B, H, rope_dim).permute(1, 2, 0)  # [H, R, B]
 
     # Run CuTe kernel
-    out_cute, _ = kernel(
-        q_latent_k,
-        q_pe_k,
-        kv_cache_latent.half(),
-        kv_cache_rope.half(),
-        block_table.T.contiguous(),
-        cache_seqlens,
-        softmax_scale,
-    )
+    out_cute, _ = kernel(q_latent_k, q_pe_k, block_table.T.contiguous(), cache_seqlens, softmax_scale)
 
     # Convert back to [B, 1, H, L]
     out_cute = out_cute.permute(2, 0, 1).view(B, 1, H, latent_dim).to(torch.bfloat16)
@@ -181,9 +177,10 @@ def test_mla_standalone():
     if rank == 0:
         print("\n=== TEST 3: PyTorch Reference (Decode S=1) ===")
 
-    # Collect all KV from cache for reference (positions 0..S_prefill)
-    all_kv_latent = kv_cache_latent.view(-1, latent_dim)[:decode_pos + 1]  # [S_prefill+1, L]
-    all_k_rope = kv_cache_rope.view(-1, rope_dim)[:decode_pos + 1]  # [S_prefill+1, R]
+    # Collect all KV from the source tensors (positions 0..S_prefill plus the decode token).
+    # This avoids depending on cache storage layout for the reference path.
+    all_kv_latent = torch.cat([kv_latent_prefill[0], kv_latent_decode[0, 0].unsqueeze(0)], dim=0)
+    all_k_rope = torch.cat([k_rope_prefill[0], k_rope_decode[0, 0].unsqueeze(0)], dim=0)
 
     out_ref_decode = pytorch_absorbed_attn_reference(
         q_latent_decode, q_pe_decode,

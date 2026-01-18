@@ -108,15 +108,18 @@ def test_cute_vs_pytorch():
     print(f"out_ref mean: {out_ref.mean().item():.4f}")
 
     # === Prepare paged KV cache ===
-    kv_cache_latent = torch.zeros(num_pages, page_size, latent_dim, device=device, dtype=torch.bfloat16)
-    kv_cache_rope = torch.zeros(num_pages, page_size, rope_dim, device=device, dtype=torch.bfloat16)
+    # CuTeDSL layout: (page_size, D, num_pages) with D stride=1.
+    kv_cache_latent_base = torch.zeros(num_pages, page_size, latent_dim, device=device, dtype=torch.bfloat16)
+    kv_cache_rope_base = torch.zeros(num_pages, page_size, rope_dim, device=device, dtype=torch.bfloat16)
+    kv_cache_latent = kv_cache_latent_base.permute(1, 2, 0)
+    kv_cache_rope = kv_cache_rope_base.permute(1, 2, 0)
 
     # Store KV at positions 0..S_kv-1
     for i in range(S_kv):
         page_idx = i // page_size
         offset = i % page_size
-        kv_cache_latent[page_idx, offset] = kv_latent_flat[i]
-        kv_cache_rope[page_idx, offset] = k_rope_flat[i]
+        kv_cache_latent_base[offset, page_idx] = kv_latent_flat[i]
+        kv_cache_rope_base[offset, page_idx] = k_rope_flat[i]
 
     # Page table: batch 0 uses pages [0, 1, 2, ...]
     block_table = torch.arange(num_pages, device=device, dtype=torch.int32).unsqueeze(0)
@@ -137,26 +140,20 @@ def test_cute_vs_pytorch():
         max_seq_len=num_pages * page_size,
         page_size=page_size,
         device=device,
+        c_latent=kv_cache_latent,
+        c_rope=kv_cache_rope,
     )
 
     # Prepare inputs for kernel: [H, D, B]
-    q_latent_k = q_latent.view(B, H, latent_dim).permute(1, 2, 0).contiguous().half()
-    q_rope_k = q_pe.view(B, H, rope_dim).permute(1, 2, 0).contiguous().half()
+    q_latent_k = q_latent.view(B, H, latent_dim).permute(1, 2, 0)
+    q_rope_k = q_pe.view(B, H, rope_dim).permute(1, 2, 0)
 
     print("\n=== CuTe Kernel Input ===")
     print(f"q_latent_k: {q_latent_k.shape} (should be [H, L, B])")
     print(f"q_rope_k: {q_rope_k.shape} (should be [H, R, B])")
     print(f"block_table.T: {block_table.T.shape} (should be [max_blocks, B])")
 
-    out_latent_k, lse = kernel(
-        q_latent_k,
-        q_rope_k,
-        kv_cache_latent.half(),
-        kv_cache_rope.half(),
-        block_table.T.contiguous(),
-        cache_seqlens,
-        softmax_scale,
-    )
+    out_latent_k, lse = kernel(q_latent_k, q_rope_k, block_table.T.contiguous(), cache_seqlens, softmax_scale)
 
     # Convert output back: [H, L, B] -> [B, 1, H, L]
     out_cute = out_latent_k.permute(2, 0, 1).view(B, S_q, H, latent_dim).to(torch.bfloat16)

@@ -141,14 +141,15 @@ def test_load_v3_0324():
     positions = torch.arange(seq_len, device=device).unsqueeze(0)
 
     # MLA KV caches:
-    # - kv_caches_latent: [num_pages, page_size, kv_lora_rank] bfloat16
-    # - kv_caches_rope: [num_pages, page_size, qk_rope_head_dim] bfloat16
+    # - kv_caches_latent: [page_size, kv_lora_rank, num_pages] bfloat16 (CuTeDSL layout; dim1 stride=1)
+    # - kv_caches_rope: [page_size, qk_rope_head_dim, num_pages] bfloat16 (CuTeDSL layout; dim1 stride=1)
+    page_size = 64
     kv_caches_latent = [
-        torch.zeros(num_blocks, 64, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device)
+        torch.zeros(num_blocks, page_size, cfg.kv_lora_rank, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
         for _ in range(cfg.num_layers)
     ]
     kv_caches_rope = [
-        torch.zeros(num_blocks, 64, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device)
+        torch.zeros(num_blocks, page_size, cfg.qk_rope_head_dim, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
         for _ in range(cfg.num_layers)
     ]
 

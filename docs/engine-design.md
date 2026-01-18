@@ -9,10 +9,13 @@ It has two goals:
 ## Targets (numbers)
 
 We optimize for **system throughput**, not isolated kernel peak. The commonly cited targets are:
-- Prefill: **50–57K tokens/sec/node**
-- Decode: **~22K tokens/sec/node**
+- Prefill: **~60K tokens/sec/node**
+- Decode: **~25K tokens/sec/node**
 
 These are end-to-end engine numbers: scheduler + cache + comm + kernels + sampling.
+
+For the canonical target/SLO definitions and measurement contract (including TTFT/ITL vs throughput),
+see `docs/serve-targets.md`.
 
 ## Hard constraints (repo contract)
 

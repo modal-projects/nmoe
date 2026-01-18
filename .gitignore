@@ -47,6 +47,7 @@ AGENTS.md.local
 
 # Internal-only debug/handoff docs (do not publish)
 *_handoff*.md
+HANDOFF.md
 PIPELINE_TEST_RESULTS.md
 
 # Third-party working trees (not shipped; only patches ship)
@@ -67,6 +68,7 @@ nviz/tsconfig.tsbuildinfo
 *.sqlite
 *.sqlite3
 *.duckdb
+torch_prof_*.tgz
 
 # Local scratch / snapshots
 tmp/
