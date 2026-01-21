@@ -38,6 +38,32 @@ __host__ __device__ __forceinline__ int ceil_div(int a, int b) { return (a + b -
 __device__ __forceinline__ float bf16_to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
 __device__ __forceinline__ __nv_bfloat16 f32_to_bf16(float v) { return __float2bfloat16(v); }
 
+// NVFP4 cache "resonance dither":
+// - Deterministic (exact-resume safe): counter-based hash on (seed, step, coords)
+// - Symmetric (zero-mean across coordinates): dither in [-A, +A]
+// - Conditional: only when RTN would keep the packed FP4 code unchanged
+//
+// Goal: prevent RTN stickiness from freezing cache codes, turning the nvfp4 path
+// into a biased stick-slip dynamic. This makes nvfp4 behave more like a useful
+// perturbation source without global stochastic rounding machinery.
+constexpr float NVFP4_DITHER_AMPL = 0.25f;        // In normalized FP4 domain (v * inv_scale)
+constexpr uint32_t NVFP4_DITHER_PROB_MASK = 0x7u; // Apply on ~12.5% of "unchanged" codes (hash & mask == 0)
+
+__device__ __forceinline__ uint32_t mix_u32(uint32_t x) {
+  // Murmur3 32-bit finalizer.
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+__device__ __forceinline__ float symm_u8(uint8_t b) {
+  // Map 0..255 -> (-0.5, +0.5)
+  return (static_cast<float>(static_cast<int>(b)) + 0.5f) * (1.0f / 256.0f) - 0.5f;
+}
+
 // AdamW update (matches the math/order of PyTorch fused AdamW: decay first).
 __device__ __forceinline__ float adamw_update_f32(
     float w,
@@ -90,7 +116,9 @@ __global__ void k_expert_adamw_w13_update_quant(
     float weight_decay,
     float eps,
     float step_size,
-    float inv_bias_correction2_sqrt) {
+    float inv_bias_correction2_sqrt,
+    uint32_t seed,
+    uint32_t step) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   const int e = static_cast<int>(blockIdx.z);
   const int j0 = static_cast<int>(blockIdx.x) * TILE_OUT;
@@ -228,7 +256,26 @@ __global__ void k_expert_adamw_w13_update_quant(
       const int j_global = j0 + j_local;
       const int m = 2 * j_global + (is_up ? 1 : 0);
       uint16_t* out_row = W13_q_u16 + static_cast<int64_t>(e) * static_cast<int64_t>(M13) * ldp + static_cast<int64_t>(m) * ldp;
-      out_row[col_u16 + p] = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
+      const int col = col_u16 + p;
+      const uint16_t old = out_row[col];
+      uint16_t q = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
+      if (q == old) {
+        uint32_t h = seed;
+        h ^= step * 0x9e3779b9u;
+        h ^= static_cast<uint32_t>(e) * 0x85ebca6bu;
+        h ^= static_cast<uint32_t>(m) * 0xc2b2ae35u;
+        h ^= static_cast<uint32_t>(col) * 0x27d4eb2fu;
+        h = mix_u32(h);
+        if ((h & NVFP4_DITHER_PROB_MASK) == 0u) {
+          const float a = 2.0f * NVFP4_DITHER_AMPL;
+          const float d0 = symm_u8(static_cast<uint8_t>(h >> 0)) * a;
+          const float d1 = symm_u8(static_cast<uint8_t>(h >> 8)) * a;
+          const float d2 = symm_u8(static_cast<uint8_t>(h >> 16)) * a;
+          const float d3 = symm_u8(static_cast<uint8_t>(h >> 24)) * a;
+          q = ptx::f32x4_to_e2m1x4_packed(v0 + d0, v1 + d1, v2 + d2, v3 + d3);
+        }
+      }
+      out_row[col] = q;
     }
 #else
     (void)W13_q_u16;
@@ -281,7 +328,9 @@ __global__ void k_expert_adamw_w2_update_quant(
     float weight_decay,
     float eps,
     float step_size,
-    float inv_bias_correction2_sqrt) {
+    float inv_bias_correction2_sqrt,
+    uint32_t seed,
+    uint32_t step) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   const int e = static_cast<int>(blockIdx.z);
   const int d0 = static_cast<int>(blockIdx.x) * TILE_K;     // K dimension in cache = Dff
@@ -384,7 +433,26 @@ __global__ void k_expert_adamw_w2_update_quant(
 
       const int h_global = h0 + row_local;
       uint16_t* out_row = W2_q_u16 + static_cast<int64_t>(e) * static_cast<int64_t>(H) * ldp + static_cast<int64_t>(h_global) * ldp;
-      out_row[col_u16 + p] = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
+      const int col = col_u16 + p;
+      const uint16_t old = out_row[col];
+      uint16_t q = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
+      if (q == old) {
+        uint32_t h = seed;
+        h ^= step * 0x9e3779b9u;
+        h ^= static_cast<uint32_t>(e) * 0x85ebca6bu;
+        h ^= static_cast<uint32_t>(h_global) * 0xc2b2ae35u;
+        h ^= static_cast<uint32_t>(col) * 0x27d4eb2fu;
+        h = mix_u32(h);
+        if ((h & NVFP4_DITHER_PROB_MASK) == 0u) {
+          const float a = 2.0f * NVFP4_DITHER_AMPL;
+          const float d0 = symm_u8(static_cast<uint8_t>(h >> 0)) * a;
+          const float d1 = symm_u8(static_cast<uint8_t>(h >> 8)) * a;
+          const float d2 = symm_u8(static_cast<uint8_t>(h >> 16)) * a;
+          const float d3 = symm_u8(static_cast<uint8_t>(h >> 24)) * a;
+          q = ptx::f32x4_to_e2m1x4_packed(v0 + d0, v1 + d1, v2 + d2, v3 + d3);
+        }
+      }
+      out_row[col] = q;
     }
 #else
     (void)W2_q_u16;
@@ -440,6 +508,8 @@ inline cudaError_t launch_expert_adamw_step(
     float eps,
     float step_size,
     float inv_bias_correction2_sqrt,
+    uint32_t seed,
+    uint32_t step,
     cudaStream_t stream) {
   if ((H & 127) != 0) return cudaErrorInvalidValue;
   if ((Dff & 127) != 0) return cudaErrorInvalidValue;
@@ -456,14 +526,16 @@ inline cudaError_t launch_expert_adamw_step(
         W3, dW3, m3, v3,
         W13_q_u16, W13_sf_mma,
         E, H, Dff,
-        lr, beta1, beta2, weight_decay, eps, step_size, inv_bias_correction2_sqrt);
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bias_correction2_sqrt,
+        seed, step);
   } else if (profile == 1) {
     k_expert_adamw_w13_update_quant<true><<<grid_w13, block, 0, stream>>>(
         W1, dW1, m1, v1,
         W3, dW3, m3, v3,
         W13_q_u16, W13_sf_mma,
         E, H, Dff,
-        lr, beta1, beta2, weight_decay, eps, step_size, inv_bias_correction2_sqrt);
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bias_correction2_sqrt,
+        seed, step);
   } else {
     return cudaErrorInvalidValue;
   }
@@ -477,13 +549,15 @@ inline cudaError_t launch_expert_adamw_step(
         W2, dW2, m2, v2,
         W2_q_u16, W2_sf_mma,
         E, H, Dff,
-        lr, beta1, beta2, weight_decay, eps, step_size, inv_bias_correction2_sqrt);
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bias_correction2_sqrt,
+        seed, step);
   } else {
     k_expert_adamw_w2_update_quant<true><<<grid_w2, block, 0, stream>>>(
         W2, dW2, m2, v2,
         W2_q_u16, W2_sf_mma,
         E, H, Dff,
-        lr, beta1, beta2, weight_decay, eps, step_size, inv_bias_correction2_sqrt);
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bias_correction2_sqrt,
+        seed, step);
   }
   return cudaGetLastError();
 }
@@ -523,6 +597,8 @@ extern "C" cudaError_t expert_adamw_step(
     float eps,
     float step_size,
     float inv_bias_correction2_sqrt,
+    uint32_t seed,
+    uint32_t step,
     cudaStream_t stream) {
   return nmoe::adamw::launch_expert_adamw_step(
       profile,
@@ -552,5 +628,7 @@ extern "C" cudaError_t expert_adamw_step(
       eps,
       step_size,
       inv_bias_correction2_sqrt,
+      seed,
+      step,
       stream);
 }
