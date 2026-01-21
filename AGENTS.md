@@ -18,6 +18,51 @@ This means: no fallbacks, no hacks, no shortcuts. Production-grade, Google-quali
 - Assume no usable GPU locally; prefer running via the provided Docker images and/or Kubernetes manifests.
 - Do not introduce a second installation path. If it is not container-first, it must be explicitly opt-in and documented.
 
+## Agent Protocol (Failure Prevention)
+
+This section exists because principles alone do not prevent repeated failures. These rules are the operational contract.
+
+### Session Start (Always)
+- Read `AGENTS.md`, then `AGENTS.md.local` (if present), then `CLAUDE.md` (if present).
+- Confirm mode and print it at the top of every response: `Mode: No-Edits` or `Mode: Execution`.
+- If executing: confirm branch (`git branch --show-current`) and working tree (`git status -sb`).
+
+### Mode Gates (Hard)
+**No-Edits Mode**
+- Trigger: user says “do not make edits/changes”, “review only”, or “planning/brainstorming”.
+- In this mode: do not modify tracked files, do not install deps, do not run destructive git ops, and do not change cluster state; only read/inspect/analyze.
+- Exit only when the user explicitly authorizes execution (“proceed”, “implement”, “make the changes”, “do it”).
+
+**Execution Mode**
+- Default when the user asks to implement/fix/build.
+- If the user says “just X”, do X immediately with minimal narration.
+
+### Scope Lock (Before Editing)
+- Before editing: list the exact files you will modify.
+- Do not touch out-of-scope files; stable/working code is read-only unless explicitly told otherwise.
+- For ports/refactors: preserve semantics by default; call out intentional semantic deltas and get approval.
+- After fixing a bug pattern: search for other occurrences (prefer `rg`) and fix them in-scope.
+
+### Don’t Guess (Ever)
+- Never guess at environment state, config values, or file contents. Verify via files, diffs, logs, or commands.
+
+### Git Safety (High Severity)
+- Do not run `git checkout`, `git restore`, `git reset`, or `git clean` without explicit approval; explain what will be lost first.
+- Never `git push` unless explicitly asked; only commit when explicitly asked.
+
+### Build Discipline (High Severity)
+- Only rebuild CUDA artifacts when relevant `nmoe/csrc/` sources changed; do not delete build outputs “just to be safe”.
+
+### Output Completeness
+- If asked for “full diff/log output”, do not truncate.
+- Provide complete copy/paste-ready commands (include `cd`, env vars, and flags).
+
+### Ultrathink Protocol (When Asked)
+1. Verified facts (code/config/logs/diffs)
+2. Unknowns / gaps
+3. Hypotheses + predicted outcomes
+4. Minimal experiments, then conclusions from results
+
 Our ethos: do one thing, exceedingly well — state‑of‑the‑art MoE training on B200 with RDEP — and nothing else. Elegant minimalism isn’t just fewer lines; it’s disciplined intent plus impeccable execution.
 
 Principles

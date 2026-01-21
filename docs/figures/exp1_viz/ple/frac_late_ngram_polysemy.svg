@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="235" height="400">
+<rect x="0" y="0" width="100%" height="100%" fill="white"/>
+<text x="80" y="26" font-size="16" font-family="sans-serif" font-weight="bold">Late-Layer Contribution (ngram_polysemy)</text>
+<text x="80" y="46" font-size="11" font-family="sans-serif" fill="#666666">frac_late = fraction of CE reduction in last 1/3 of layers</text>
+<line x1="80" y1="320.0" x2="195" y2="320.0" stroke="#e0e0e0" stroke-width="1"/>
+<text x="72" y="324.0" font-size="10" font-family="sans-serif" text-anchor="end">0.00</text>
+<line x1="80" y1="270.0" x2="195" y2="270.0" stroke="#e0e0e0" stroke-width="1"/>
+<text x="72" y="274.0" font-size="10" font-family="sans-serif" text-anchor="end">0.09</text>
+<line x1="80" y1="220.0" x2="195" y2="220.0" stroke="#e0e0e0" stroke-width="1"/>
+<text x="72" y="224.0" font-size="10" font-family="sans-serif" text-anchor="end">0.19</text>
+<line x1="80" y1="170.0" x2="195" y2="170.0" stroke="#e0e0e0" stroke-width="1"/>
+<text x="72" y="174.0" font-size="10" font-family="sans-serif" text-anchor="end">0.28</text>
+<line x1="80" y1="120.0" x2="195" y2="120.0" stroke="#e0e0e0" stroke-width="1"/>
+<text x="72" y="124.0" font-size="10" font-family="sans-serif" text-anchor="end">0.38</text>
+<line x1="80" y1="70.0" x2="195" y2="70.0" stroke="#e0e0e0" stroke-width="1"/>
+<text x="72" y="74.0" font-size="10" font-family="sans-serif" text-anchor="end">0.47</text>
+<text x="20" y="195.0" font-size="11" font-family="sans-serif" font-weight="bold" text-anchor="middle" transform="rotate(-90 20 195.0)">frac_late</text>
+<line x1="80" y1="142.77723322105786" x2="195" y2="142.77723322105786" stroke="#e41a1c" stroke-width="1.5" stroke-dasharray="5,3"/>
+<text x="200" y="146.77723322105786" font-size="9" font-family="sans-serif" fill="#e41a1c">1/3</text>
+<rect x="80" y="227.57686925815503" width="50" height="92.42313074184497" fill="#e41a1c" stroke="white" stroke-width="1"/>
+<text x="105.0" y="222.57686925815503" font-size="9" font-family="sans-serif" text-anchor="middle" font-weight="bold">0.17</text>
+<text x="105.0" y="335" font-size="9" font-family="sans-serif" text-anchor="start" transform="rotate(45 105.0 335)">width=fixed,...</text>
+<rect x="145" y="92.72727272727275" width="50" height="227.27272727272725" fill="#377eb8" stroke="white" stroke-width="1"/>
+<text x="170.0" y="87.72727272727275" font-size="9" font-family="sans-serif" text-anchor="middle" font-weight="bold">0.43</text>
+<text x="170.0" y="335" font-size="9" font-family="sans-serif" text-anchor="start" transform="rotate(45 170.0 335)">width=fixed,...</text>
+</svg>
