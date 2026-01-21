@@ -1,0 +1,384 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{tcolorbox}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=cyan,
+  pdftitle={Routing Geometry Artifact Schemas},
+}
+
+\title{Routing Geometry: Artifact Layout and JSON Schemas}
+\author{Anonymous Authors}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+
+This document defines the \emph{artifact contract} for routing-geometry verification tests.
+The intent is to make each reported measurement (i) independently re-bootstrappable (store per-window summaries), (ii) semantically unambiguous (record gate semantics and score dtype), and (iii) easy to compare across checkpoints/domains.
+
+\section{Directory Layout}
+
+All routing-geometry tests write results under a user-chosen output root \texttt{OUT\_ROOT}.
+The recommended layout is:
+
+\begin{tcolorbox}[colback=blue!3!white,colframe=blue!55!black,title=Recommended Output Layout]
+\begin{verbatim}
+OUT_ROOT/
+  <test_name>/
+    <edge_name>/
+      <domain>/
+        <direction>/
+          run.json
+          manifest.json
+          stdout.log
+\end{verbatim}
+\end{tcolorbox}
+
+Where:
+\begin{itemize}
+  \item \texttt{test\_name} is one of: \texttt{boundary\_amplification}, \texttt{chart\_compatibility}, \texttt{terminal\_ovk\_scan}, \texttt{terminal\_tracking}, \texttt{behavior\_compression} (diagnostic), \texttt{kl\_edge\_dominance}, \texttt{entropy\_collapse} (diagnostic), \texttt{kl\_bounded\_adaptation} (unimplemented).
+  \item \texttt{edge\_name} is a stable string such as \texttt{dsv3\_0324\_\_\_vs\_\_\_dsv3\_2\_speciale}.
+  \item \texttt{domain} is the dataset slice identifier (e.g., \texttt{fineweb}, \texttt{code}, \texttt{med}).
+  \item \texttt{direction} is either \texttt{AtoB} or \texttt{BtoA} (defines which checkpoint is the reference for stratification, when applicable).
+\end{itemize}
+
+\section{Common Metadata Fields}
+
+Every \texttt{run.json} must include:
+\begin{itemize}
+  \item \textbf{Identity:} \texttt{schema\_version}, \texttt{test}, and either \texttt{edge} (for comparisons) or \texttt{model} (for single-checkpoint tests), plus \texttt{domain}.
+  \item \textbf{Data:} raw-text source description (\texttt{data.parquet\_glob} or equivalent), \texttt{data.n\_windows}, \texttt{data.seq\_len}, and a deterministic \texttt{data.seed}.
+  \item \textbf{Gate semantics:} \texttt{topk}, \texttt{scores\_dtype="fp32"}, and any family-specific semantics (grouping/masks/bias).
+  \item \textbf{Bootstrap:} bootstrapping is over windows, not tokens; record \texttt{summary.bootstrap.B} and \texttt{summary.bootstrap.seed} and store per-window summary arrays sufficient to re-bootstrap.
+\end{itemize}
+
+\section{Schemas}
+
+\subsection{Boundary amplification (\texttt{boundary\_amplification})}
+
+\paragraph{Intent.}
+Quantify how disagreement mass $d_t=1-\mathrm{ov}_k$ concentrates in the low set-margin tail of $m_{\mathrm{set}}$.
+
+\paragraph{Required keys (minimal).}
+\begin{tcolorbox}[colback=gray!4!white,colframe=gray!55!black,title=\texttt{run.json} (boundary amplification)]
+\begin{verbatim}
+{
+  "schema_version": 1,
+  "test": "boundary_amplification",
+  "edge": {"ckpt_a": "...", "ckpt_b": "...", "edge_name": "...", "direction": "AtoB"},
+  "domain": "...",
+  "data": {"tokenizer": "...", "parquet_glob": "...", "n_windows": 200, "seq_len": 256, "seed": 1234},
+  "gate_semantics": {"topk": 8, "scores_dtype": "fp32"},
+  "layers": [10,20,30,40,50,60],
+  "compression_qs": [0.01,0.05,0.10,0.20],
+  "decile_bins": 10,
+  "verification": {"required_layers": [30,40,50]},
+  "y_ref_A": {
+    "k": 8,
+    "scores_fp32": true,
+    "layers": [10,20,30,40,50,60],
+    "per_layer": {
+      "10": {
+        "compression": {"q10": {"F": 0.0, "m_thr": 0.0, "sel_frac": 0.10}},
+        "compression_F_per_window": {"q10": [..n_windows..], "q20": [..]},
+        "compression_F_minus_q_ci95": {"q10": [0.0, 0.0]},
+        "deciles": [{"bin": 0, "m_lo": 0.0, "m_hi": 0.0, "ov_mean": 0.0, "n": 0}]
+      },
+      "...": {}
+    }
+  },
+  "y_ref_B": null,
+  "summary": {"bootstrap": {"B": 200, "seed": 1234}},
+  "manifest": {"created_utc": "...", "script": "traj_boundary_amplification_ondist_topk.py"}
+}
+\end{verbatim}
+\end{tcolorbox}
+
+\subsection{Chart compatibility (\texttt{chart\_compatibility})}
+
+\paragraph{Intent.}
+Test whether the adjacent set-boundary competitor charts (the $k$-th vs $(k\!+\!1)$-th experts) are \emph{more compatible near the set boundary} (low $m_{\mathrm{set}}$), relative to a random competitor kill-shot.
+
+\paragraph{Random-e2 control semantics.}
+\texttt{random\_e2} draws one competitor $e_{\mathrm{rand}}$ uniformly from $\mathrm{Eligible}(y)\setminus\{e_k,e_{k+1}\}$ under the exact gate semantics profile (group masks and shared-expert exclusion).
+
+\paragraph{V2 axis mapping (data-only reporting).}
+The V2 decomposition used in analysis corresponds directly to stored fields:
+\begin{itemize}
+  \item C1 (boundary vs interior): $\Delta_{\mathrm{BI}} = \widetilde{\kappa}_{\mathrm{hidden}}(w,\mathcal{B})-\widetilde{\kappa}_{\mathrm{hidden}}(w,\mathcal{I})$ is summarized by \texttt{summary.per\_layer[$\ell$].kappa\_hidden.delta} and CI95.
+  \item C2 (adjacency specificity / kill-shot): $\Delta_{\mathrm{Brand}} = \widetilde{\kappa}_{\mathrm{hidden}}(w,\mathcal{B})-\widetilde{\kappa}_{\mathrm{hidden}}^{\mathrm{rand}}(w,\mathcal{B})$ is summarized by \texttt{summary.per\_layer[$\ell$].random\_e2\_delta\_hidden\_boundary.delta} and CI95.
+\end{itemize}
+The per-window medians required to recompute both axes are stored under \texttt{per\_window.boundary/interior/boundary\_random\_e2} as \texttt{kappa\_hidden\_median[$\ell$]} arrays.
+
+\paragraph{Required keys (minimal).}
+\begin{tcolorbox}[colback=gray!4!white,colframe=gray!55!black,title=\texttt{run.json} (chart compatibility)]
+\begin{verbatim}
+{
+  "schema_version": 1,
+  "test": "chart_compatibility",
+  "edge": {"ckpt_a": "...", "ckpt_b": "...", "direction": "AtoB"},
+  "domain": "...",
+  "data": {"parquet_glob": "...", "n_windows": 200, "seq_len": 256, "seed": 12345},
+  "gate_semantics": {"topk": 8, "scores_dtype": "fp32"},
+  "layers": [10,20,30,40,50,60],
+  "strata_def": {"margin_used": "m_set", "pair_def": "k_kp1", "boundary_quantile": 0.10, "interior_quantile": 0.50},
+  "verification": {"required_layers": [30,40,50]},
+  "controls": {"random_e2": true},
+  "per_window": {
+    "boundary": {"kappa_hidden_median": {"10": [..], ...}, "kappa_target_median": {"10": [..], ...}},
+    "interior": {"kappa_hidden_median": {"10": [..], ...}, "kappa_target_median": {"10": [..], ...}},
+    "boundary_random_e2": {"kappa_hidden_median": {"10": [..], ...}, "kappa_target_median": {"10": [..], ...}},
+    "interior_random_e2": {"kappa_hidden_median": {"10": [..], ...}, "kappa_target_median": {"10": [..], ...}}
+  },
+  "summary": {
+    "per_layer": {
+      "10": {
+        "kappa_hidden": {"delta": 0.0, "ci95": [0.0,0.0]},
+        "kappa_target": {"delta": 0.0, "ci95": [0.0,0.0]},
+        "random_e2_delta_hidden_boundary": {"delta": 0.0, "ci95": [0.0,0.0]},
+        "random_e2_delta_target_boundary": {"delta": 0.0, "ci95": [0.0,0.0]}
+      }
+    },
+    "bootstrap": {"B": 200, "seed": 12345}
+  }
+}
+\end{verbatim}
+\end{tcolorbox}
+
+\subsection{Terminal ov$_k$ scan (\texttt{terminal\_ovk\_scan})}
+
+\paragraph{Intent.}
+Establish a depth-localized change point in counterfactual re-gating overlap $\mathrm{ov}_k^{\mathrm{cf}}$.
+
+\paragraph{Required keys (minimal).}
+\begin{tcolorbox}[colback=gray!4!white,colframe=gray!55!black,title=\texttt{run.json} (terminal ov$_k$ scan)]
+\begin{verbatim}
+{
+  "schema_version": 1,
+  "test": "terminal_ovk_scan",
+  "model": {"ckpt": "...", "terminal_moe_layer": 60},
+  "domain": "...",
+  "data": {"parquet_glob": "...", "n_windows": 200, "seq_len": 256, "seed": 12345},
+  "gate_semantics": {"topk": 8, "scores_dtype": "fp32"},
+  "layers": [10,20,30,40,50,59,60],
+  "per_window": {
+    "ovk_cf_mean": {"10": [..n_windows..], "...": [], "60": []},
+    "swap_k_mean": {"10": [..], "...": [], "60": []}
+  },
+  "summary": {
+    "per_layer": {"60": {"ovk_cf_mean": 0.0, "ovk_cf_ci95": [0.0,0.0]}},
+    "max_jump": {"pair": "59->60", "delta_mean": 0.0, "ci95": [0.0,0.0]},
+    "bootstrap": {"B": 200, "seed": 12345}
+  }
+}
+\end{verbatim}
+\end{tcolorbox}
+
+\paragraph{swap$_k$ semantics.}
+\texttt{swap\_k\_mean[$\ell$]} is the mean of $\mathbf{1}[e_k(y_{\mathrm{pre}})\ne e_k(y_{\mathrm{post}})]$ across tokens in each window at layer $\ell$.
+
+\subsection{Terminal tracking (\texttt{terminal\_tracking})}
+
+\paragraph{Intent.}
+Bundle multiple V3 \texttt{terminal\_ovk\_scan} artifacts from distinct models and verify that the terminal cliff localizes at each model's terminal MoE layer, with at least two distinct terminal depths present (V4 in \texttt{docs/routing\_geometry\_spec.tex}).
+
+\paragraph{Producer.}
+\texttt{scripts/testD\_terminal\_tracking.py}
+
+\paragraph{Required keys (minimal).}
+\begin{tcolorbox}[colback=gray!4!white,colframe=gray!55!black,title=\texttt{run.json} (terminal tracking)]
+\begin{verbatim}
+{
+  "schema_version": 1,
+  "test": "terminal_tracking",
+  "verification": {"min_distinct_terminals": 2},
+  "scans": [
+    {"schema_version": 1, "test": "terminal_ovk_scan", "...": "..."},
+    {"schema_version": 1, "test": "terminal_ovk_scan", "...": "..."}
+  ],
+  "summary": {
+    "n_scans": 2,
+    "terminal_moe_layers": [60, 26],
+    "distinct_terminal_moe_layers": [26, 60]
+  }
+}
+\end{verbatim}
+\end{tcolorbox}
+
+\subsection{Behavioral compression (\texttt{behavior\_compression})}
+
+\paragraph{Intent.}
+Quantify whether \emph{behavioral} change between two checkpoints is more boundary-supported than \emph{routing} change, when stratifying by set-margin $m_{\mathrm{set}}$ under the reference checkpoint.
+
+\paragraph{Producer.}
+\texttt{scripts/traj\_behavior\_compression\_ondist\_topk.py}
+
+\paragraph{Required keys (minimal).}
+\begin{tcolorbox}[colback=gray!4!white,colframe=gray!55!black,title=\texttt{run.json} (behavioral compression)]
+\begin{verbatim}
+{
+  "schema_version": 1,
+  "test": "behavior_compression",
+  "edge": {"ckpt_a": "...", "ckpt_b": "...", "edge_name": "...", "direction": "AtoB"},
+  "domain": "...",
+  "data": {"parquet_glob": "...", "n_windows": 200, "seq_len": 256, "seed": 12345},
+  "gate_semantics": {"topk": 8, "scores_dtype": "fp32"},
+  "layers": [10,20,30,40,50,60],
+  "compression_qs": [0.01,0.05,0.10,0.20],
+  "per_window": {
+    "F_route": {"30": {"q10": [..n_windows..], "q20": [..]} },
+    "F_beh":   {"30": {"q10": [..n_windows..], "q20": [..]} },
+    "m_thr":   {"30": {"q10": [..n_windows..], "q20": [..]} }
+  },
+  "summary": {
+    "F_route_by_layer": {"30": {"q10": {"mean": 0.0, "ci95": [0.0,0.0]}}},
+    "F_beh_by_layer":   {"30": {"q10": {"mean": 0.0, "ci95": [0.0,0.0]}}},
+    "bootstrap": {"B": 200, "seed": 12345}
+  }
+}
+\end{verbatim}
+\end{tcolorbox}
+
+\subsection{KL-bounded adaptation (\texttt{kl\_bounded\_adaptation})}
+
+\paragraph{Intent.}
+Verify that a frozen-set recipe yields bounded mean KL from base, bounded forgetting, and a positive KL-forgetting correlation across runs (per property \texttt{prop:kl\_bounded} / V5b in \texttt{docs/routing\_geometry\_spec.tex}).
+
+\paragraph{Producer.}
+\texttt{scripts/testE\_kl\_bounded\_adaptation.py} (UNIMPLEMENTED).
+
+\paragraph{Required keys (minimal).}
+The correlation test (pass criterion 3) requires measurements across $K \geq 5$ distinct training runs or checkpoints.
+The schema stores per-run metrics in a \texttt{runs} array.
+
+\begin{tcolorbox}[colback=gray!4!white,colframe=gray!55!black,title=\texttt{run.json} (KL-bounded adaptation)]
+\begin{verbatim}
+{
+  "schema_version": 1,
+  "test": "kl_bounded_adaptation",
+  "base": {"ckpt": "..."},
+  "frozen_set": [0,1,2],
+  "thresholds": {"D_max": 0.0, "L_max": 0.0},
+  "data": {
+    "eval": {"source": "...", "n": 1000, "seed": 12345},
+    "base": {"source": "...", "n": 1000, "seed": 12346}
+  },
+  "runs": [
+    {"ckpt": "tuned_run1", "seed": 1, "D_hat": 0.0, "L_forget_hat": 0.0},
+    {"ckpt": "tuned_run2", "seed": 2, "D_hat": 0.0, "L_forget_hat": 0.0},
+    "..."
+  ],
+  "baseline": {"ckpt": "...", "frozen_set": [], "D_hat": 0.0, "L_forget_hat": 0.0},
+  "summary": {
+    "D_hat_mean": 0.0,
+    "L_forget_hat_mean": 0.0,
+    "correlation": {"rho": 0.0, "ci95": [0.0, 0.0], "K": 5},
+    "freeze_advantage": {"D_delta": 0.0, "L_delta": 0.0},
+    "bootstrap": {"B": 200, "seed": 12345}
+  }
+}
+\end{verbatim}
+\end{tcolorbox}
+
+\subsection{KL-forgetting edge dominance (\texttt{kl\_edge\_dominance})}
+
+\paragraph{Intent.}
+Verify the open-weights ``edge dominance'' property (\texttt{prop:kl\_edge\_dominance} / V5a): across pre-registered edges within a checkpoint family, increasing KL drift from base implies increasing base-domain regression (a forgetting proxy), with CI-separated inequalities on fixed domains (canonical: \texttt{fineweb}, \texttt{code}).
+
+\paragraph{Producer.}
+\texttt{scripts/testE\_kl\_edge\_dominance.py}.
+
+\paragraph{Required keys (minimal).}
+The schema stores per-window arrays for each checkpoint (relative to the base checkpoint) so every edge inequality can be re-bootstrapped.
+
+\begin{tcolorbox}[colback=gray!4!white,colframe=gray!55!black,title=\texttt{run.json} (KL edge dominance)]
+\begin{verbatim}
+{
+  "schema_version": 1,
+  "test": "kl_edge_dominance",
+  "family": {
+    "family_name": "...",
+    "base_ckpt": "...",
+    "ckpts": ["...", "..."],
+    "ckpt_paths": {"ckptA": "...", "ckptB": "..."},
+    "base_ckpt_dir": "..."
+  },
+  "domains": ["fineweb", "code"],
+  "data": {
+    "fineweb": {"parquet_glob": "...", "text_field": "text", "max_docs": 5000, "n_windows": 200, "seq_len": 256, "seed": 12345},
+    "code": {"parquet_glob": "...", "text_field": "text", "max_docs": 5000, "n_windows": 200, "seq_len": 256, "seed": 12346}
+  },
+  "edges": [
+    {"from": "...", "to": "..."},
+    {"from": "...", "to": "..."}
+  ],
+  "per_window": {
+    "fineweb": {
+      "D": {"ckptA": [..n_windows..], "ckptB": [..]},
+      "L_forget": {"ckptA": [..n_windows..], "ckptB": [..]}
+    },
+    "code": {
+      "D": {"ckptA": [..n_windows..], "ckptB": [..]},
+      "L_forget": {"ckptA": [..n_windows..], "ckptB": [..]}
+    }
+  },
+  "summary": {
+    "per_domain": {
+      "fineweb": {
+        "ckptA": {"D_hat": {"mean": 0.0, "ci95": [0.0, 0.0]}, "L_forget_hat": {"mean": 0.0, "ci95": [0.0, 0.0]}},
+        "ckptB": {"D_hat": {"mean": 0.0, "ci95": [0.0, 0.0]}, "L_forget_hat": {"mean": 0.0, "ci95": [0.0, 0.0]}}
+      }
+    },
+    "edges": {
+      "fineweb": {"ckptA__to__ckptB": {"D_delta_ci95": [0.0, 0.0], "L_delta_ci95": [0.0, 0.0]}}
+    },
+    "bootstrap": {"B": 200, "seed": 12345}
+  }
+}
+\end{verbatim}
+\end{tcolorbox}
+
+\subsection{Entropy collapse (\texttt{entropy\_collapse})}
+
+\paragraph{Intent.}
+Measure shifts in the shape of the next-token distribution across a checkpoint family, via entropy and varentropy on teacher-forced windows. This is a diagnostic for entropy collapse along SFT/RL edges.
+
+\paragraph{Producer.}
+\texttt{scripts/testF\_entropy\_collapse.py}
+
+\paragraph{Required keys (minimal).}
+The schema stores per-window mean entropy $H(w)$ and varentropy $V(w)$ for each checkpoint and domain, so deltas and confidence intervals can be re-bootstrapped.
+
+\begin{tcolorbox}[colback=gray!4!white,colframe=gray!55!black,title=\texttt{run.json} (entropy collapse)]
+\begin{verbatim}
+{
+  "schema_version": 1,
+  "test": "entropy_collapse",
+  "family": {"family_name": "...", "base_ckpt": "...", "ckpts": ["...", "..."]},
+  "domains": ["fineweb", "code"],
+  "data": {
+    "fineweb": {"parquet_glob": "...", "text_field": "text", "max_docs": 5000, "n_windows": 200, "seq_len": 256, "seed": 12345},
+    "code": {"parquet_glob": "...", "text_field": "text", "max_docs": 5000, "n_windows": 200, "seq_len": 256, "seed": 12346}
+  },
+  "edges": [{"from": "...", "to": "..."}],
+  "per_window": {
+    "fineweb": {"H": {"ckptA": [..n_windows..]}, "V": {"ckptA": [..n_windows..]}},
+    "code": {"H": {"ckptA": [..n_windows..]}, "V": {"ckptA": [..n_windows..]}}
+  },
+  "summary": {"bootstrap": {"B": 200, "seed": 12345}}
+}
+\end{verbatim}
+\end{tcolorbox}
+
+\end{document}
