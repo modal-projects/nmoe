@@ -175,7 +175,15 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
       continue
 
     # Dense params: split decay vs no-decay by name pattern
-    no_decay = name.endswith('.bias') or 'norm' in name or name.startswith('embedding.') or name.startswith('lm_head.') or 'bungee' in name
+    is_adapter = name.endswith('.A') or name.endswith('.B') or name.endswith('.g')
+    no_decay = (
+      is_adapter
+      or name.endswith('.bias')
+      or 'norm' in name
+      or name.startswith('embedding.')
+      or name.startswith('lm_head.')
+      or 'bungee' in name
+    )
     if no_decay:
       dense_params_no_decay.append(param)
     else:

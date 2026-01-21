@@ -84,7 +84,12 @@ class Config:
   adam_beta2: float = 0.95
   adam_beta2_expert: float = 0.99  # Higher for FP8 gradient noise
   adam_eps: float = 1e-8
+
+  # NorMuon optimizer (for 2D weight matrices)
+  use_muon: bool = False  # Enable NorMuon for attention/MLP weights
+  lr_muon: float = 0.023  # Muon learning rate (matches modded-nanogpt)
   muon_momentum: float = 0.95
+  muon_weight_decay: float = 1.2  # Higher WD for Muon (matches modded-nanogpt)
 
   # =============================================================================
   # Scheduler (WSD - Warmup-Sustain-Decay)
@@ -102,6 +107,9 @@ class Config:
   seq_len: int = 4096
   seed: int = 42
   log_every: int = 10
+  # Loss masking: by default we treat eos_token_id as padding and exclude it from loss.
+  # For benchmarks where EOS/BOS is a real token (e.g. GPT-2 FineWeb .bin streams), set false.
+  loss_mask_eos: bool = True
 
   # Checkpointing
   checkpoint_dir: str = "/data/checkpoints"
@@ -148,15 +156,40 @@ class Config:
   # =============================================================================
   rl_enabled: bool = False
   rl_algorithm: str = "grpo"  # grpo | ppo | dpo
-  grpo_kl_beta: float = 0.001
-  grpo_clamp_eps_lower: float = 0.01
-  grpo_clamp_eps_upper: float = 0.01
-  grpo_group_size: int = 2
-  grpo_prompts_per_step: int = 32
-  grpo_iterations: int = 2
-  grpo_temperature: float = 1.0
-  grpo_top_p: float = 0.9
-  reward_model_path: Optional[str] = None
+
+  # GRPO core (DeepSeek-R1 uses: group_size=16, kl_coef=0.001, clip_eps=10, temp=1.0)
+  rl_group_size: int = 8  # Samples per prompt (G in paper, DeepSeek uses 16)
+  rl_kl_coef: float = 0.001  # KL penalty coefficient (β)
+  rl_clip_eps: float = 0.2  # PPO clipping epsilon
+  rl_kl_type: str = "k3"  # KL estimator: k1 | k2 | k3 (k3=reverse KL, recommended)
+
+  # Dr.GRPO fixes (arxiv 2503.20783)
+  rl_normalize_mean: bool = True  # Subtract group mean
+  rl_normalize_std: bool = False  # Divide by group std (NOT recommended per Dr.GRPO)
+  rl_length_norm_constant: bool = True  # Use constant length normalization (Dr.GRPO fix)
+
+  # Anti-reward-hacking
+  rl_use_opsm: bool = False  # Off-Policy Sequence Masking
+  rl_opsm_delta: float = 1e-4  # KL threshold for OPSM
+  rl_filter_zero_std: bool = True  # Filter groups with zero reward variance
+  rl_neg_adv_scale: float = 1.0  # Scale negative advantages (>1 penalizes bad more)
+  rl_dual_clip_c: Optional[float] = None  # Dual-clip PPO for negative advantages
+  rl_clip_eps_high: Optional[float] = None  # Asymmetric upper clip
+
+  # Rollout settings
+  rl_temperature: float = 0.7  # Sampling temperature
+  rl_top_p: float = 0.95  # Nucleus sampling
+  rl_max_new_tokens: int = 512  # Max generation length
+  rl_updates_per_batch: int = 2  # PPO-style multiple updates
+
+  # =============================================================================
+  # PERL (optional) — Parameter-Efficient RL via L/DoRA (Mode A)
+  # =============================================================================
+  perl_enabled: bool = False
+  perl_rank_total: int = 32  # Total rank budget (v0 default: 32)
+  perl_alpha: Optional[float] = None  # LoRA alpha (default: alpha=rank -> scale=1)
+  perl_adapt_lm_head: bool = False  # Unembedding/LM head is excluded by default
+  perl_irc_window_steps: int = 256  # Invariance window length (steps) for IRC guardrails
 
   # =============================================================================
   # Multi-Token Prediction (optional)
@@ -172,6 +205,7 @@ class Config:
   validation_data_path: Optional[str] = None
   validation_every: int = 500
   validation_steps: int = 100
+  target_loss: Optional[float] = None  # Stop when val_loss <= target (speedruns)
 
   # =============================================================================
   # Profiling (optional)
