@@ -44,11 +44,39 @@ https://github.com/NVIDIA/cutlass/blob/main/LICENSE.txt
 
 ---
 
+## TensorRT-LLM
+
+Apache License 2.0
+
+https://github.com/NVIDIA/TensorRT-LLM
+
+---
+
 ## NVIDIA NVSHMEM
 
 NVIDIA Software License Agreement (proprietary)
 
 https://docs.nvidia.com/nvshmem/
+
+---
+
+## vLLM
+
+Apache License 2.0
+
+Portions of `nmoe/serve/benchmark_router_vllm_grouped_topk.cu` are derived from vLLM.
+
+https://github.com/vllm-project/vllm
+
+---
+
+## SGLang
+
+Apache License 2.0
+
+Portions of `nmoe/serve/kernels/sglang_moe_fused_gate.cu` are derived from SGLang.
+
+https://github.com/sgl-project/sglang
 
 ---
 

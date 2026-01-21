@@ -4,6 +4,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <cuda_runtime.h>
 
@@ -45,6 +46,66 @@ extern "C" {
   void rdep_open_ipc_handles_blockscaled(const void* handles, int world);
   void rdep_sync_buffer_ptrs_bf16();
   void rdep_sync_buffer_ptrs_blockscaled();
+  void rdep_ipc_barrier_phase_bf16(cudaStream_t stream);
+  void rdep_ipc_barrier_tag_bf16(cudaStream_t stream);
+  void rdep_ipc_barrier_zero_bf16(cudaStream_t stream);
+
+	  // Inference IPC transport (serve; FP8 activations + local routing metadata)
+	  void rdep_infer_init_ipc_fp8(
+	      int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	      const void* barrier_handles,
+	      const void* recv_x_fp8_handles,
+	      const void* recv_x_scale_handles,
+	      const void* recv_topk_idx_handles,
+	      const void* recv_topk_w_handles,
+	      const void* ret_y_handles);
+	  void rdep_infer_init_ipc_fp8_local(
+	      int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	      const void* barrier_handles,
+	      const void* recv_x_fp8_handles,
+	      const void* recv_x_scale_handles,
+	      const void* recv_topk_idx_handles,
+	      const void* recv_topk_w_handles,
+	      const void* ret_y_handles,
+	      void* local_barrier,
+	      void* local_recv_x_fp8,
+	      void* local_recv_x_scale,
+	      void* local_recv_topk_idx,
+	      void* local_recv_topk_w,
+	      void* local_ret_y);
+	  void rdep_infer_init_ipc_slab_fp8_local(
+	      int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	      const void* slab_handles,
+	      const int64_t* slab_off_bytes,
+	      void* local_slab_ptr);
+	  void rdep_infer_init_ipc_storage_fp8(
+	      int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	      const void* recv_x_fp8_handles, const int64_t* recv_x_fp8_off_bytes,
+	      const void* recv_x_scale_handles, const int64_t* recv_x_scale_off_bytes,
+	      const void* recv_topk_idx_handles, const int64_t* recv_topk_idx_off_bytes,
+	      const void* recv_topk_w_handles, const int64_t* recv_topk_w_off_bytes,
+	      const void* ret_y_handles, const int64_t* ret_y_off_bytes);
+	  void rdep_infer_init_ptrs_fp8(
+	      int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	      const void* barrier_ptrs_u64,
+	      const void* recv_x_fp8_ptrs_u64,
+	      const void* recv_x_scale_ptrs_u64,
+	      const void* recv_topk_idx_ptrs_u64,
+	      const void* recv_topk_w_ptrs_u64,
+	      const void* ret_y_ptrs_u64);
+	  void rdep_infer_dispatch_fp8(
+	      int channel,
+	      const void* x_fp8,
+	      const void* x_scale,
+	      const int64_t* topk_idx,
+	      const float* topk_w,
+	      uint8_t* send_mask_out,
+	      int T_local,
+	      cudaStream_t stream);
+	  void rdep_infer_barrier_tag(cudaStream_t stream);
+	  void rdep_infer_return_bf16(int channel, const void* y_partial, cudaStream_t stream);
+	  void rdep_infer_return_bf16_indexed(int channel, const void* y_partial, const int32_t* slot_ids, int N, cudaStream_t stream);
+	  void rdep_infer_reduce_bf16(int channel, void* y_out, const uint8_t* send_mask, cudaStream_t stream);
 
   // BF16 path
   void rdep_alloc_bf16(size_t capacity, int H, int n_local);
@@ -301,6 +362,269 @@ PYBIND11_MODULE(rdep, m) {
         "Sync BF16 buffer pointers to device");
   m.def("sync_buffer_ptrs_blockscaled", &rdep_sync_buffer_ptrs_blockscaled,
         "Sync blockscaled buffer pointers to device");
+
+  // ========== IPC Barrier Microbench Helpers ==========
+  // phase barrier: fast in eager mode, but NOT graph-replay-safe (phase must monotonically increase).
+  // tag barrier: graph-replay-safe (returns signals to zero each call), but uses remote atomics.
+  m.def("ipc_barrier_phase_bf16", [](py::object stream) {
+    rdep_ipc_barrier_phase_bf16(to_stream(stream));
+  }, py::arg("stream") = py::none(),
+     "IPC phase barrier for BF16 path (not graph-replay-safe).");
+
+  m.def("ipc_barrier_tag_bf16", [](py::object stream) {
+    rdep_ipc_barrier_tag_bf16(to_stream(stream));
+  }, py::arg("stream") = py::none(),
+     "IPC tag barrier for BF16 path (graph-replay-safe).");
+
+  m.def("ipc_barrier_zero_bf16", [](py::object stream) {
+    rdep_ipc_barrier_zero_bf16(to_stream(stream));
+  }, py::arg("stream") = py::none(),
+     "Zero local IPC barrier signals for BF16 path (debug/microbench helper).");
+
+  // ========== CUDA IPC helpers (serve bootstrap) ==========
+  m.def("ipc_get_mem_handle", [](uintptr_t ptr) {
+    py::array_t<uint8_t> handle(IPC_HANDLE_SIZE);
+    cudaIpcMemHandle_t memh;
+    auto err = cudaIpcGetMemHandle(&memh, reinterpret_cast<void*>(ptr));
+    if (err != cudaSuccess) throw std::runtime_error("cudaIpcGetMemHandle failed: " + cuda_err(err));
+    std::memcpy(handle.mutable_data(), &memh, sizeof(memh));
+    return handle;
+  }, py::arg("ptr"),
+     "Get a CUDA IPC handle (64 bytes) for a device allocation pointer.");
+
+  // ========== Inference IPC transport (serve) ==========
+	  m.def(
+	      "infer_init_ipc_fp8",
+	      [](int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	         py::array_t<uint8_t> barrier_handles,
+	         py::array_t<uint8_t> recv_x_fp8_handles,
+	         py::array_t<uint8_t> recv_x_scale_handles,
+	         py::array_t<uint8_t> recv_topk_idx_handles,
+	         py::array_t<uint8_t> recv_topk_w_handles,
+	         py::array_t<uint8_t> ret_y_handles) {
+	        rdep_infer_init_ipc_fp8(
+	            channel, rank, world, T_cap, H, K, n_local, expert_placement,
+	            barrier_handles.data(),
+	            recv_x_fp8_handles.data(),
+	            recv_x_scale_handles.data(),
+	            recv_topk_idx_handles.data(),
+	            recv_topk_w_handles.data(),
+	            ret_y_handles.data());
+	      },
+	      py::arg("channel"),
+	      py::arg("rank"),
+	      py::arg("world"),
+	      py::arg("T_cap"),
+	      py::arg("H"),
+      py::arg("K"),
+      py::arg("n_local"),
+      py::arg("expert_placement") = 0,
+      py::arg("barrier_handles"),
+      py::arg("recv_x_fp8_handles"),
+      py::arg("recv_x_scale_handles"),
+      py::arg("recv_topk_idx_handles"),
+      py::arg("recv_topk_w_handles"),
+      py::arg("ret_y_handles"),
+      "Initialize inference IPC transport by opening per-rank CUDA IPC handles and syncing device pointer tables.");
+
+	  m.def(
+	      "infer_init_ipc_fp8_local",
+	      [](int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	         py::array_t<uint8_t> barrier_handles,
+	         py::array_t<uint8_t> recv_x_fp8_handles,
+	         py::array_t<uint8_t> recv_x_scale_handles,
+	         py::array_t<uint8_t> recv_topk_idx_handles,
+         py::array_t<uint8_t> recv_topk_w_handles,
+         py::array_t<uint8_t> ret_y_handles,
+         uintptr_t local_barrier,
+         uintptr_t local_recv_x_fp8,
+         uintptr_t local_recv_x_scale,
+	         uintptr_t local_recv_topk_idx,
+	         uintptr_t local_recv_topk_w,
+	         uintptr_t local_ret_y) {
+	        rdep_infer_init_ipc_fp8_local(
+	            channel, rank, world, T_cap, H, K, n_local, expert_placement,
+	            barrier_handles.data(),
+	            recv_x_fp8_handles.data(),
+	            recv_x_scale_handles.data(),
+	            recv_topk_idx_handles.data(),
+	            recv_topk_w_handles.data(),
+            ret_y_handles.data(),
+            reinterpret_cast<void*>(local_barrier),
+            reinterpret_cast<void*>(local_recv_x_fp8),
+            reinterpret_cast<void*>(local_recv_x_scale),
+	            reinterpret_cast<void*>(local_recv_topk_idx),
+	            reinterpret_cast<void*>(local_recv_topk_w),
+	            reinterpret_cast<void*>(local_ret_y));
+	      },
+	      py::arg("channel"),
+	      py::arg("rank"),
+	      py::arg("world"),
+	      py::arg("T_cap"),
+	      py::arg("H"),
+      py::arg("K"),
+      py::arg("n_local"),
+      py::arg("expert_placement") = 0,
+      py::arg("barrier_handles"),
+      py::arg("recv_x_fp8_handles"),
+      py::arg("recv_x_scale_handles"),
+      py::arg("recv_topk_idx_handles"),
+      py::arg("recv_topk_w_handles"),
+      py::arg("ret_y_handles"),
+      py::arg("local_barrier"),
+      py::arg("local_recv_x_fp8"),
+      py::arg("local_recv_x_scale"),
+      py::arg("local_recv_topk_idx"),
+      py::arg("local_recv_topk_w"),
+      py::arg("local_ret_y"),
+      "Initialize inference IPC transport while binding local pointers directly (skips cudaIpcOpenMemHandle for self).");
+
+	  m.def(
+	      "infer_init_ipc_slab_fp8_local",
+	      [](int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	         py::array_t<uint8_t> slab_handles,
+	         py::array_t<int64_t> slab_off_bytes,
+	         uintptr_t local_slab_ptr) {
+	        if (slab_off_bytes.ndim() != 1 || slab_off_bytes.shape(0) < 6) {
+	          throw std::runtime_error("slab_off_bytes must be a 1D int64 array of length >= 6");
+	        }
+	        rdep_infer_init_ipc_slab_fp8_local(
+	            channel, rank, world, T_cap, H, K, n_local, expert_placement,
+	            slab_handles.data(),
+	            slab_off_bytes.data(),
+	            reinterpret_cast<void*>(local_slab_ptr));
+	      },
+	      py::arg("channel"),
+	      py::arg("rank"),
+	      py::arg("world"),
+	      py::arg("T_cap"),
+	      py::arg("H"),
+      py::arg("K"),
+      py::arg("n_local"),
+      py::arg("expert_placement") = 0,
+      py::arg("slab_handles"),
+      py::arg("slab_off_bytes"),
+      py::arg("local_slab_ptr"),
+      "Initialize inference IPC transport from a single per-rank slab (one CUDA-IPC handle per rank).");
+
+	  m.def(
+	      "infer_init_ipc_storage_fp8",
+	      [](int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	         py::array_t<uint8_t> recv_x_fp8_handles, py::array_t<int64_t> recv_x_fp8_off,
+	         py::array_t<uint8_t> recv_x_scale_handles, py::array_t<int64_t> recv_x_scale_off,
+	         py::array_t<uint8_t> recv_topk_idx_handles, py::array_t<int64_t> recv_topk_idx_off,
+	         py::array_t<uint8_t> recv_topk_w_handles, py::array_t<int64_t> recv_topk_w_off,
+	         py::array_t<uint8_t> ret_y_handles, py::array_t<int64_t> ret_y_off) {
+	        rdep_infer_init_ipc_storage_fp8(
+	            channel, rank, world, T_cap, H, K, n_local, expert_placement,
+	            recv_x_fp8_handles.data(), recv_x_fp8_off.data(),
+	            recv_x_scale_handles.data(), recv_x_scale_off.data(),
+	            recv_topk_idx_handles.data(), recv_topk_idx_off.data(),
+	            recv_topk_w_handles.data(), recv_topk_w_off.data(),
+	            ret_y_handles.data(), ret_y_off.data());
+	      },
+	      py::arg("channel"),
+	      py::arg("rank"),
+	      py::arg("world"),
+	      py::arg("T_cap"),
+	      py::arg("H"),
+      py::arg("K"),
+      py::arg("n_local"),
+      py::arg("expert_placement") = 0,
+      py::arg("recv_x_fp8_handles"),
+      py::arg("recv_x_fp8_off_bytes"),
+      py::arg("recv_x_scale_handles"),
+      py::arg("recv_x_scale_off_bytes"),
+      py::arg("recv_topk_idx_handles"),
+      py::arg("recv_topk_idx_off_bytes"),
+      py::arg("recv_topk_w_handles"),
+      py::arg("recv_topk_w_off_bytes"),
+      py::arg("ret_y_handles"),
+      py::arg("ret_y_off_bytes"),
+      "Initialize inference transport using Torch storage IPC handles (handle+byte-offset per rank).");
+
+	  m.def(
+	      "infer_init_ptrs_fp8",
+	      [](int channel, int rank, int world, int T_cap, int H, int K, int n_local, int expert_placement,
+	         py::array_t<uint64_t> barrier_ptrs,
+	         py::array_t<uint64_t> recv_x_fp8_ptrs,
+	         py::array_t<uint64_t> recv_x_scale_ptrs,
+	         py::array_t<uint64_t> recv_topk_idx_ptrs,
+	         py::array_t<uint64_t> recv_topk_w_ptrs,
+	         py::array_t<uint64_t> ret_y_ptrs) {
+	        rdep_infer_init_ptrs_fp8(
+	            channel, rank, world, T_cap, H, K, n_local, expert_placement,
+	            barrier_ptrs.data(),
+	            recv_x_fp8_ptrs.data(),
+	            recv_x_scale_ptrs.data(),
+	            recv_topk_idx_ptrs.data(),
+	            recv_topk_w_ptrs.data(),
+	            ret_y_ptrs.data());
+	      },
+	      py::arg("channel"),
+	      py::arg("rank"),
+	      py::arg("world"),
+	      py::arg("T_cap"),
+	      py::arg("H"),
+      py::arg("K"),
+      py::arg("n_local"),
+      py::arg("expert_placement") = 0,
+      py::arg("barrier_ptrs"),
+      py::arg("recv_x_fp8_ptrs"),
+      py::arg("recv_x_scale_ptrs"),
+      py::arg("recv_topk_idx_ptrs"),
+      py::arg("recv_topk_w_ptrs"),
+      py::arg("ret_y_ptrs"),
+      "Initialize inference transport by syncing already-opened per-rank device pointers (uint64).");
+
+	  m.def(
+	      "infer_dispatch_fp8",
+	      [](int channel, uintptr_t x_fp8_ptr, uintptr_t x_scale_ptr, uintptr_t topk_idx_ptr, uintptr_t topk_w_ptr, uintptr_t send_mask_ptr, int T_local, py::object stream) {
+	        rdep_infer_dispatch_fp8(
+	            channel,
+	            reinterpret_cast<const void*>(x_fp8_ptr),
+	            reinterpret_cast<const void*>(x_scale_ptr),
+	            reinterpret_cast<const int64_t*>(topk_idx_ptr),
+	            reinterpret_cast<const float*>(topk_w_ptr),
+            reinterpret_cast<uint8_t*>(send_mask_ptr),
+	            T_local,
+	            to_stream(stream));
+	      },
+	      py::arg("channel"),
+	      py::arg("x_fp8"),
+	      py::arg("x_scale"),
+	      py::arg("topk_idx"),
+	      py::arg("topk_w"),
+      py::arg("send_mask"),
+      py::arg("T_local"),
+      py::arg("stream") = py::none(),
+      "Dispatch per-rank FP8 activations + routing metadata into per-rank recv buffers via CUDA IPC.");
+
+	  m.def("infer_barrier_tag", [](py::object stream) {
+	    rdep_infer_barrier_tag(to_stream(stream));
+	  }, py::arg("stream") = py::none(), "Graph-replay-safe IPC tag barrier for inference transport.");
+
+	  m.def("infer_return_bf16", [](int channel, uintptr_t y_partial_ptr, py::object stream) {
+	    rdep_infer_return_bf16(channel, reinterpret_cast<const void*>(y_partial_ptr), to_stream(stream));
+	  }, py::arg("channel"), py::arg("y_partial"), py::arg("stream") = py::none(), "Return BF16 per-token contributions to owners via CUDA IPC.");
+
+	  m.def("infer_return_bf16_indexed", [](int channel, uintptr_t y_partial_ptr, uintptr_t slot_ids_ptr, int N, py::object stream) {
+	    rdep_infer_return_bf16_indexed(
+	        channel,
+	        reinterpret_cast<const void*>(y_partial_ptr),
+	        reinterpret_cast<const int32_t*>(slot_ids_ptr),
+	        N,
+	        to_stream(stream));
+	  }, py::arg("channel"), py::arg("y_partial"), py::arg("slot_ids"), py::arg("N"), py::arg("stream") = py::none(),
+	     "Return BF16 contributions for a compact list of slots (slot_ids in [0, world*T_cap)) via CUDA IPC.");
+
+	  m.def("infer_reduce_bf16", [](int channel, uintptr_t y_out_ptr, uintptr_t send_mask_ptr, py::object stream) {
+	    rdep_infer_reduce_bf16(
+	        channel,
+	        reinterpret_cast<void*>(y_out_ptr),
+	        reinterpret_cast<const uint8_t*>(send_mask_ptr),
+	        to_stream(stream));
+	  }, py::arg("channel"), py::arg("y_out"), py::arg("send_mask"), py::arg("stream") = py::none(), "Reduce owner return buffers into local output [T_cap,H].");
 
   // ========== BF16 Path ==========
   m.def("alloc_bf16", [](size_t capacity, int H, int n_local) {

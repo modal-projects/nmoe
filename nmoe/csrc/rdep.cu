@@ -15,6 +15,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cub/cub.cuh>
 #include <cstdio>
 #include <cstdint>
@@ -724,6 +725,178 @@ __device__ int   d_my_rank_block;
 __device__ int   d_world_bf16;
 __device__ int   d_world_block;
 
+// ============================================================================
+// Inference IPC Transport (FP8 activations + local routing metadata)
+//
+// This is a minimal, decode-focused transport primitive intended to replace
+// DeepEP in nmoe.serve. It uses CUDA IPC pointers plus a graph-replay-safe
+// tag barrier (barrier_block) for system-scope ordering.
+//
+// Contract (v0):
+// - Fixed slot mapping: slot = src_rank * T_cap + tok (tok in [0, T_cap)).
+// - Sender writes its local tokens into every destination rank's recv buffers.
+//   (This is intentionally simple and graph-friendly; we can add selective sends
+//    after we have correctness + perf baselines.)
+// - Receiver runs local expert compute using recv_topk_idx (local expert ids or -1)
+//   and recv_topk_w. Tokens with no local hits have all -1 and are ignored.
+// - Return: each rank writes a per-token bf16 contribution back to the owner
+//   rank's ret_y[from_rank, slot, :]. Owner reduces across from_rank.
+// ============================================================================
+
+constexpr int INFER_CHANNELS = 2;  // 0=decode, 1=prefill
+
+enum InferExpertPlacement : int {
+    INFER_EXPERT_PLACEMENT_CONTIGUOUS = 0,  // eid -> (dst=eid/n_local, local=eid% n_local)
+    INFER_EXPERT_PLACEMENT_STRIPED = 1,     // eid -> (dst=eid%world, local=eid/world)
+};
+
+struct InferState {
+    bool initialized = false;
+    int rank = 0;
+    int world = 1;
+    int T_cap = 0;     // per-rank token cap (decode: 32)
+    int H = 0;
+    int Hsf = 0;       // H / 128
+    int K = 0;         // topk
+    int n_local = 0;   // num_local_experts
+    int expert_placement = INFER_EXPERT_PLACEMENT_CONTIGUOUS;
+
+    // Remote base pointers for each rank's buffers.
+    int* barrier_signal_ptrs[MAX_RANKS] = {nullptr};
+    void* recv_x_fp8_ptrs[MAX_RANKS] = {nullptr};
+    void* recv_x_scale_ptrs[MAX_RANKS] = {nullptr};
+    void* recv_topk_idx_ptrs[MAX_RANKS] = {nullptr};
+    void* recv_topk_w_ptrs[MAX_RANKS] = {nullptr};
+    void* ret_y_ptrs[MAX_RANKS] = {nullptr};
+};
+
+static InferState g_infer[INFER_CHANNELS];
+
+__device__ int*  d_infer_barrier_signal_ptrs[INFER_CHANNELS][MAX_RANKS];
+__device__ void* d_infer_recv_x_fp8_ptrs[INFER_CHANNELS][MAX_RANKS];
+__device__ void* d_infer_recv_x_scale_ptrs[INFER_CHANNELS][MAX_RANKS];
+__device__ void* d_infer_recv_topk_idx_ptrs[INFER_CHANNELS][MAX_RANKS];
+__device__ void* d_infer_recv_topk_w_ptrs[INFER_CHANNELS][MAX_RANKS];
+__device__ void* d_infer_ret_y_ptrs[INFER_CHANNELS][MAX_RANKS];
+__device__ int   d_infer_rank;
+__device__ int   d_infer_world;
+__device__ int   d_infer_T_cap[INFER_CHANNELS];
+__device__ int   d_infer_H[INFER_CHANNELS];
+__device__ int   d_infer_Hsf[INFER_CHANNELS];
+__device__ int   d_infer_K[INFER_CHANNELS];
+__device__ int   d_infer_n_local[INFER_CHANNELS];
+__device__ int   d_infer_expert_placement[INFER_CHANNELS];
+
+extern "C" void rdep_infer_init_ipc_fp8(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* barrier_handles,     // [world * IPC_HANDLE_SIZE]
+    const void* recv_x_fp8_handles,  // [world * IPC_HANDLE_SIZE]
+    const void* recv_x_scale_handles,
+    const void* recv_topk_idx_handles,
+    const void* recv_topk_w_handles,
+    const void* ret_y_handles);
+
+extern "C" void rdep_infer_init_ipc_fp8_local(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* barrier_handles,
+    const void* recv_x_fp8_handles,
+    const void* recv_x_scale_handles,
+    const void* recv_topk_idx_handles,
+    const void* recv_topk_w_handles,
+    const void* ret_y_handles,
+    void* local_barrier,
+    void* local_recv_x_fp8,
+    void* local_recv_x_scale,
+    void* local_recv_topk_idx,
+    void* local_recv_topk_w,
+    void* local_ret_y);
+
+extern "C" void rdep_infer_init_ipc_storage_fp8(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* recv_x_fp8_handles,
+    const int64_t* recv_x_fp8_off_bytes,
+    const void* recv_x_scale_handles,
+    const int64_t* recv_x_scale_off_bytes,
+    const void* recv_topk_idx_handles,
+    const int64_t* recv_topk_idx_off_bytes,
+    const void* recv_topk_w_handles,
+    const int64_t* recv_topk_w_off_bytes,
+    const void* ret_y_handles,
+    const int64_t* ret_y_off_bytes);
+
+extern "C" void rdep_infer_init_ipc_slab_fp8_local(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* slab_handles,         // [world * IPC_HANDLE_SIZE]
+    const int64_t* slab_off_bytes,    // [6] int64 offsets into the slab
+    void* local_slab_ptr);
+
+extern "C" void rdep_infer_init_ptrs_fp8(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* barrier_ptrs_u64,     // [world] uint64 (device pointers opened by PyTorch IPC)
+    const void* recv_x_fp8_ptrs_u64,  // [world] uint64
+    const void* recv_x_scale_ptrs_u64,
+    const void* recv_topk_idx_ptrs_u64,
+    const void* recv_topk_w_ptrs_u64,
+    const void* ret_y_ptrs_u64);
+
+extern "C" void rdep_infer_dispatch_fp8(
+    int channel,
+    const void* x_fp8,           // [T_local, H] float8_e4m3fn
+    const void* x_scale,         // [T_local, Hsf] float32
+    const int64_t* topk_idx,     // [T_local, K] int64 (global expert ids)
+    const float* topk_w,         // [T_local, K] float32
+    uint8_t* send_mask_out,      // [T_cap] uint8 bitmask of destination ranks for each local token
+    int T_local,
+    cudaStream_t stream);
+
+extern "C" void rdep_infer_barrier_tag(cudaStream_t stream);
+
+extern "C" void rdep_infer_return_bf16(
+    int channel,
+    const void* y_partial,  // [B_global, H] bfloat16
+    cudaStream_t stream);
+
+extern "C" void rdep_infer_reduce_bf16(
+    int channel,
+    void* y_out,                 // [T_cap, H] bfloat16 (only first T_local used by caller)
+    const uint8_t* send_mask,    // [T_cap] bitmask of ranks contributing to each local token
+    cudaStream_t stream);
+
 // One-CTA, system-scope cross-GPU barriers (IPC mode).
 // Declared here for use in forward dispatch/return; defined below with other IPC helpers.
 __global__ void k_ipc_barrier_phase_bf16(int phase);
@@ -858,6 +1031,798 @@ __global__ void k_dispatch_bf16(
 
     // Fence to ensure all sys-scope writes are visible before kernel completes
     fence_acq_rel_sys();
+}
+
+// ============================================================================
+// Inference IPC Transport Kernels (v0, fixed slot mapping)
+// ============================================================================
+
+__global__ void k_infer_barrier_tag() {
+    // Reuse the proven IPC barrier signal table from the BF16 RDEP path.
+    // This avoids relying on PyTorch-allocated IPC mappings for remote atomics.
+    barrier_block_dynamic(d_barrier_signal_ptrs_bf16, d_my_rank_bf16, d_world_bf16);
+}
+
+extern "C" void rdep_infer_barrier_tag(cudaStream_t stream) {
+    // Use the BF16 RDEP world size (barrier signal table is owned by BF16 RDEP).
+    if (g_bf16.world <= 1) return;
+    k_infer_barrier_tag<<<1, 256, 0, stream>>>();
+}
+
+__global__ void k_infer_dispatch_fp8(
+    int channel,
+    const __nv_fp8_e4m3* __restrict__ x_fp8,  // [T_local, H]
+    const float* __restrict__ x_scale,        // [T_local, Hsf]
+    const int64_t* __restrict__ topk_idx,     // [T_local, K] global expert ids
+    const float* __restrict__ topk_w,         // [T_local, K]
+    uint8_t* __restrict__ send_mask_out,      // [T_cap]
+    int T_local)
+{
+    const int world = d_infer_world;
+    const int my_rank = d_infer_rank;
+    const int T_cap = d_infer_T_cap[channel];
+    const int H = d_infer_H[channel];
+    const int Hsf = d_infer_Hsf[channel];
+    const int K = d_infer_K[channel];
+    const int n_local = d_infer_n_local[channel];
+    const int placement = d_infer_expert_placement[channel];
+
+    const int tok = blockIdx.x;        // 0..T_cap-1 (tokens >= T_local are padding)
+    const int tid = threadIdx.x;
+
+    const int slot = my_rank * T_cap + tok;
+
+    // Padding tokens: clear routing + mask to avoid stale phantom slots.
+    if (tok >= T_local) {
+        if (tid == 0) send_mask_out[tok] = static_cast<uint8_t>(0);
+        for (int dst_rank = 0; dst_rank < world; ++dst_rank) {
+            int64_t* recv_eid = reinterpret_cast<int64_t*>(d_infer_recv_topk_idx_ptrs[channel][dst_rank]);
+            float* recv_w = reinterpret_cast<float*>(d_infer_recv_topk_w_ptrs[channel][dst_rank]);
+            if (tid < K) {
+                recv_eid[(int64_t)slot * K + tid] = static_cast<int64_t>(-1);
+                recv_w[(int64_t)slot * K + tid] = 0.0f;
+            }
+        }
+        // Ensure peer-visible ordering for the cleared metadata.
+        fence_acq_rel_sys();
+        return;
+    }
+
+    // Compute rank-hit mask for this token: bit r set iff token routes to any expert on rank r.
+    __shared__ uint32_t mask;
+    if (tid == 0) mask = 0u;
+    __syncthreads();
+    if (tid < K) {
+        const int64_t eid = topk_idx[(int64_t)tok * K + tid];
+        const int dst = (placement == INFER_EXPERT_PLACEMENT_STRIPED)
+                            ? static_cast<int>(eid % world)
+                            : static_cast<int>(eid / n_local);
+        if (dst >= 0 && dst < world) {
+            atomicOr(&mask, 1u << dst);
+        }
+    }
+    __syncthreads();
+    if (tid == 0) send_mask_out[tok] = static_cast<uint8_t>(mask);
+    __syncthreads();
+
+    // Write routing metadata for all destination ranks (small: world*K = 64 writes/token).
+    for (int dst_rank = 0; dst_rank < world; ++dst_rank) {
+        int64_t* recv_eid = reinterpret_cast<int64_t*>(d_infer_recv_topk_idx_ptrs[channel][dst_rank]);
+        float* recv_w = reinterpret_cast<float*>(d_infer_recv_topk_w_ptrs[channel][dst_rank]);
+        if (tid < K) {
+            const int64_t eid = topk_idx[(int64_t)tok * K + tid];
+            const float w = topk_w[(int64_t)tok * K + tid];
+            const int dst = (placement == INFER_EXPERT_PLACEMENT_STRIPED)
+                                ? static_cast<int>(eid % world)
+                                : static_cast<int>(eid / n_local);
+            const int local = (placement == INFER_EXPERT_PLACEMENT_STRIPED)
+                                  ? static_cast<int>(eid / world)
+                                  : static_cast<int>(eid - static_cast<int64_t>(dst) * n_local);
+            recv_eid[(int64_t)slot * K + tid] = (dst == dst_rank) ? static_cast<int64_t>(local) : static_cast<int64_t>(-1);
+            recv_w[(int64_t)slot * K + tid] = (dst == dst_rank) ? w : 0.0f;
+        }
+    }
+
+    // Copy activations (FP8) and scales only to ranks that are actually hit.
+    // This avoids broadcast-to-all-ranks (critical for prefill buckets).
+    for (int dst_rank = 0; dst_rank < world; ++dst_rank) {
+        if ((mask & (1u << dst_rank)) == 0u) continue;
+        __nv_fp8_e4m3* recv_x = reinterpret_cast<__nv_fp8_e4m3*>(d_infer_recv_x_fp8_ptrs[channel][dst_rank]);
+        float* recv_sf = reinterpret_cast<float*>(d_infer_recv_x_scale_ptrs[channel][dst_rank]);
+        for (int h = tid; h < H; h += blockDim.x) {
+            recv_x[(int64_t)slot * H + h] = x_fp8[(int64_t)tok * H + h];
+        }
+        for (int s = tid; s < Hsf; s += blockDim.x) {
+            recv_sf[(int64_t)slot * Hsf + s] = x_scale[(int64_t)tok * Hsf + s];
+        }
+    }
+
+    // Ensure peer-visible ordering for all remote writes before the tag barrier.
+    fence_acq_rel_sys();
+}
+
+extern "C" void rdep_infer_dispatch_fp8(
+    int channel,
+    const void* x_fp8,
+    const void* x_scale,
+    const int64_t* topk_idx,
+    const float* topk_w,
+    uint8_t* send_mask_out,
+    int T_local,
+    cudaStream_t stream)
+{
+    if (channel < 0 || channel >= INFER_CHANNELS) {
+        printf("rdep_infer_dispatch_fp8: invalid channel=%d\n", channel);
+        std::abort();
+    }
+    InferState& st = g_infer[channel];
+    if (!st.initialized) return;
+    if (st.world <= 1) return;
+    if (T_local > st.T_cap) {
+        // Fail fast (no silent truncation).
+        printf("rdep_infer_dispatch_fp8: T_local=%d exceeds T_cap=%d\n", T_local, st.T_cap);
+        std::abort();
+    }
+    if (send_mask_out == nullptr) {
+        printf("rdep_infer_dispatch_fp8: send_mask_out must be non-null\n");
+        std::abort();
+    }
+    // Always launch up to T_cap to clear routing for padding tokens (tok>=T_local) and
+    // prevent stale phantom slots from previous steps. Payload is only copied to hit ranks.
+    dim3 grid(st.T_cap, 1, 1);
+    k_infer_dispatch_fp8<<<grid, 256, 0, stream>>>(
+        channel,
+        reinterpret_cast<const __nv_fp8_e4m3*>(x_fp8),
+        reinterpret_cast<const float*>(x_scale),
+        topk_idx,
+        topk_w,
+        send_mask_out,
+        T_local);
+}
+
+__global__ void k_infer_return_bf16(
+    int channel,
+    const __nv_bfloat16* __restrict__ y_partial,  // [B_global, H]
+    int B_global)
+{
+    const int T_cap = d_infer_T_cap[channel];
+    const int H = d_infer_H[channel];
+    const int K = d_infer_K[channel];
+    const int my_rank = d_infer_rank;
+    const int tid = threadIdx.x;
+    const int slot = blockIdx.x;  // 0..B_global-1
+    const int owner = slot / T_cap;
+    const int tok = slot - owner * T_cap;
+
+    __nv_bfloat16* ret = reinterpret_cast<__nv_bfloat16*>(d_infer_ret_y_ptrs[channel][owner]);
+    // ret layout (on owner): [world, T_cap, H]
+    const int64_t base = ((int64_t)my_rank * T_cap + tok) * (int64_t)H;
+    const int64_t src = (int64_t)slot * (int64_t)H;
+
+    // Skip tokens with no local expert hits on this rank to avoid unnecessary return traffic.
+    // This is safe because the owner-side reduction uses send_mask (computed from routing)
+    // and never reads contributions from ranks not in the mask.
+    const int64_t* recv_eid_local = reinterpret_cast<const int64_t*>(d_infer_recv_topk_idx_ptrs[channel][my_rank]);
+    __shared__ int has_local;
+    if (tid == 0) has_local = 0;
+    __syncthreads();
+    if (tid < K) {
+        if (recv_eid_local[(int64_t)slot * K + tid] >= 0) {
+            atomicExch(&has_local, 1);
+        }
+    }
+    __syncthreads();
+    if (has_local == 0) return;
+
+    const bool is_remote = (owner != my_rank);
+    if (!is_remote) {
+        for (int h = tid; h < H; h += blockDim.x) {
+            ret[base + h] = y_partial[src + h];
+        }
+    } else {
+        int h = tid * 8;
+        for (; h + 8 <= H; h += blockDim.x * 8) {
+            int4 v = *reinterpret_cast<const int4*>(y_partial + src + h);
+            int4* d = reinterpret_cast<int4*>(ret + base + h);
+            st_relaxed_sys_v4_s32(d, v);
+        }
+        for (int hh = h + tid; hh < H; hh += blockDim.x) {
+            const uint16_t u = reinterpret_cast<const uint16_t*>(y_partial + src)[hh];
+            st_relaxed_sys_b16(reinterpret_cast<uint16_t*>(ret + base) + hh, u);
+        }
+    }
+
+    fence_acq_rel_sys();
+}
+
+extern "C" void rdep_infer_return_bf16(int channel, const void* y_partial, cudaStream_t stream) {
+    if (channel < 0 || channel >= INFER_CHANNELS) {
+        printf("rdep_infer_return_bf16: invalid channel=%d\n", channel);
+        std::abort();
+    }
+    InferState& st = g_infer[channel];
+    if (!st.initialized) return;
+    if (st.world <= 1) return;
+    const int B_global = st.world * st.T_cap;
+    if (B_global <= 0) return;
+    k_infer_return_bf16<<<B_global, 256, 0, stream>>>(
+        channel,
+        reinterpret_cast<const __nv_bfloat16*>(y_partial),
+        B_global);
+}
+
+__global__ void k_infer_return_bf16_indexed(
+    int channel,
+    const __nv_bfloat16* __restrict__ y_partial,  // [N, H]
+    const int32_t* __restrict__ slot_ids,         // [N] slots in [0, world*T_cap)
+    int N)
+{
+    const int T_cap = d_infer_T_cap[channel];
+    const int H = d_infer_H[channel];
+    const int my_rank = d_infer_rank;
+    const int tid = threadIdx.x;
+    const int i = blockIdx.x;
+    if (i >= N) return;
+
+    const int slot = slot_ids[i];
+    const int owner = slot / T_cap;
+    const int tok = slot - owner * T_cap;
+
+    __nv_bfloat16* ret = reinterpret_cast<__nv_bfloat16*>(d_infer_ret_y_ptrs[channel][owner]);
+    // ret layout (on owner): [world, T_cap, H]
+    const int64_t base = ((int64_t)my_rank * T_cap + tok) * (int64_t)H;
+    const int64_t src = (int64_t)i * (int64_t)H;
+
+    const bool is_remote = (owner != my_rank);
+    if (!is_remote) {
+        for (int h = tid; h < H; h += blockDim.x) {
+            ret[base + h] = y_partial[src + h];
+        }
+    } else {
+        int h = tid * 8;
+        for (; h + 8 <= H; h += blockDim.x * 8) {
+            int4 v = *reinterpret_cast<const int4*>(y_partial + src + h);
+            int4* d = reinterpret_cast<int4*>(ret + base + h);
+            st_relaxed_sys_v4_s32(d, v);
+        }
+        for (int hh = h + tid; hh < H; hh += blockDim.x) {
+            const uint16_t u = reinterpret_cast<const uint16_t*>(y_partial + src)[hh];
+            st_relaxed_sys_b16(reinterpret_cast<uint16_t*>(ret + base) + hh, u);
+        }
+    }
+
+    fence_acq_rel_sys();
+}
+
+extern "C" void rdep_infer_return_bf16_indexed(
+    int channel,
+    const void* y_partial,
+    const int32_t* slot_ids,
+    int N,
+    cudaStream_t stream)
+{
+    if (channel < 0 || channel >= INFER_CHANNELS) {
+        printf("rdep_infer_return_bf16_indexed: invalid channel=%d\n", channel);
+        std::abort();
+    }
+    InferState& st = g_infer[channel];
+    if (!st.initialized) return;
+    if (st.world <= 1) return;
+    if (N <= 0) return;
+    if (slot_ids == nullptr) {
+        printf("rdep_infer_return_bf16_indexed: slot_ids must be non-null\n");
+        std::abort();
+    }
+    k_infer_return_bf16_indexed<<<N, 256, 0, stream>>>(
+        channel,
+        reinterpret_cast<const __nv_bfloat16*>(y_partial),
+        slot_ids,
+        N);
+}
+
+__global__ void k_infer_reduce_bf16(
+    int channel,
+    const __nv_bfloat16* __restrict__ ret_y,    // [world, T_cap, H] local
+    const uint8_t* __restrict__ send_mask,      // [T_cap]
+    __nv_bfloat16* __restrict__ y_out)          // [T_cap, H] local
+{
+    const int world = d_infer_world;
+    const int T_cap = d_infer_T_cap[channel];
+    const int H = d_infer_H[channel];
+
+    const int tok = blockIdx.x;  // 0..T_cap-1
+    const int tid = threadIdx.x;
+    const int64_t out_base = (int64_t)tok * (int64_t)H;
+
+    const uint32_t mask = static_cast<uint32_t>(send_mask[tok]);
+    if (mask == 0u) {
+        for (int h = tid; h < H; h += blockDim.x) {
+            y_out[out_base + h] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
+
+    for (int h = tid; h < H; h += blockDim.x) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < MAX_RANKS; ++r) {
+            if (r >= world) break;
+            if ((mask & (1u << r)) == 0u) continue;
+            const int64_t idx = ((int64_t)r * T_cap + tok) * (int64_t)H + h;
+            acc += __bfloat162float(ret_y[idx]);
+        }
+        y_out[out_base + h] = __float2bfloat16(acc);
+    }
+}
+
+extern "C" void rdep_infer_reduce_bf16(int channel, void* y_out, const uint8_t* send_mask, cudaStream_t stream) {
+    if (channel < 0 || channel >= INFER_CHANNELS) {
+        printf("rdep_infer_reduce_bf16: invalid channel=%d\n", channel);
+        std::abort();
+    }
+    InferState& st = g_infer[channel];
+    if (!st.initialized) return;
+    if (st.world <= 1) return;
+    if (send_mask == nullptr) {
+        printf("rdep_infer_reduce_bf16: send_mask must be non-null\n");
+        std::abort();
+    }
+    const __nv_bfloat16* ret = reinterpret_cast<const __nv_bfloat16*>(st.ret_y_ptrs[st.rank]);
+    k_infer_reduce_bf16<<<st.T_cap, 256, 0, stream>>>(
+        channel,
+        ret,
+        send_mask,
+        reinterpret_cast<__nv_bfloat16*>(y_out));
+}
+
+// ============================================================================
+// Inference IPC bootstrap (open CUDA IPC handles for per-rank tensors)
+// ============================================================================
+
+static inline void open_ipc_ptrs(void** out_ptrs, const void* handles, int world) {
+    const uint8_t* h = reinterpret_cast<const uint8_t*>(handles);
+    for (int r = 0; r < world; ++r) {
+        cudaIpcMemHandle_t memh;
+        memcpy(&memh, h + r * sizeof(cudaIpcMemHandle_t), sizeof(cudaIpcMemHandle_t));
+        void* ptr = nullptr;
+        cudaError_t err = cudaIpcOpenMemHandle(&ptr, memh, cudaIpcMemLazyEnablePeerAccess);
+        if (err != cudaSuccess) {
+            printf("rdep_infer_init_ipc_fp8: cudaIpcOpenMemHandle failed for rank=%d: %s\n", r, cudaGetErrorString(err));
+            std::abort();
+        }
+        out_ptrs[r] = ptr;
+    }
+}
+
+static inline void open_ipc_ptrs_with_offset(void** out_ptrs, const void* handles, const int64_t* off_bytes, int world) {
+    const uint8_t* h = reinterpret_cast<const uint8_t*>(handles);
+    for (int r = 0; r < world; ++r) {
+        cudaIpcMemHandle_t memh;
+        memcpy(&memh, h + r * sizeof(cudaIpcMemHandle_t), sizeof(cudaIpcMemHandle_t));
+        void* base = nullptr;
+        cudaError_t err = cudaIpcOpenMemHandle(&base, memh, cudaIpcMemLazyEnablePeerAccess);
+        if (err != cudaSuccess) {
+            printf("rdep_infer_init_ipc_storage_fp8: cudaIpcOpenMemHandle failed for rank=%d: %s\n", r, cudaGetErrorString(err));
+            std::abort();
+        }
+        const int64_t off = off_bytes ? off_bytes[r] : 0;
+        out_ptrs[r] = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(base) + off);
+    }
+}
+
+static inline void open_ipc_ptrs_with_local(void** out_ptrs, const void* handles, int world, int rank, void* local_ptr) {
+    const uint8_t* h = reinterpret_cast<const uint8_t*>(handles);
+    for (int r = 0; r < world; ++r) {
+        if (r == rank) {
+            out_ptrs[r] = local_ptr;
+            continue;
+        }
+        cudaIpcMemHandle_t memh;
+        memcpy(&memh, h + r * sizeof(cudaIpcMemHandle_t), sizeof(cudaIpcMemHandle_t));
+        void* ptr = nullptr;
+        cudaError_t err = cudaIpcOpenMemHandle(&ptr, memh, cudaIpcMemLazyEnablePeerAccess);
+        if (err != cudaSuccess) {
+            printf("rdep_infer_init_ipc_fp8_local: cudaIpcOpenMemHandle failed for rank=%d: %s\n", r, cudaGetErrorString(err));
+            std::abort();
+        }
+        out_ptrs[r] = ptr;
+    }
+}
+
+extern "C" void rdep_infer_init_ipc_fp8(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* barrier_handles,
+    const void* recv_x_fp8_handles,
+    const void* recv_x_scale_handles,
+    const void* recv_topk_idx_handles,
+    const void* recv_topk_w_handles,
+    const void* ret_y_handles)
+{
+    // Ensure the correct CUDA device/context is current on this host thread
+    // before opening IPC handles (torch may have set the device in Python, but
+    // we fail fast if the C++ side doesn't see a valid context).
+    cudaSetDevice(rank);
+    cudaFree(nullptr);  // force context creation
+
+    if (world > MAX_RANKS) {
+        printf("rdep_infer_init_ipc_fp8: world=%d exceeds MAX_RANKS=%d\n", world, MAX_RANKS);
+        std::abort();
+    }
+    if (channel < 0 || channel >= INFER_CHANNELS) {
+        printf("rdep_infer_init_ipc_fp8: invalid channel=%d\n", channel);
+        std::abort();
+    }
+    if (expert_placement != INFER_EXPERT_PLACEMENT_CONTIGUOUS && expert_placement != INFER_EXPERT_PLACEMENT_STRIPED) {
+        printf("rdep_infer_init_ipc_fp8: invalid expert_placement=%d\n", expert_placement);
+        std::abort();
+    }
+    InferState& st = g_infer[channel];
+    st.rank = rank;
+    st.world = world;
+    st.T_cap = T_cap;
+    st.H = H;
+    st.Hsf = H / 128;
+    st.K = K;
+    st.n_local = n_local;
+    st.expert_placement = expert_placement;
+
+    open_ipc_ptrs(reinterpret_cast<void**>(st.barrier_signal_ptrs), barrier_handles, world);
+    open_ipc_ptrs(reinterpret_cast<void**>(st.recv_x_fp8_ptrs), recv_x_fp8_handles, world);
+    open_ipc_ptrs(reinterpret_cast<void**>(st.recv_x_scale_ptrs), recv_x_scale_handles, world);
+    open_ipc_ptrs(reinterpret_cast<void**>(st.recv_topk_idx_ptrs), recv_topk_idx_handles, world);
+    open_ipc_ptrs(reinterpret_cast<void**>(st.recv_topk_w_ptrs), recv_topk_w_handles, world);
+    open_ipc_ptrs(reinterpret_cast<void**>(st.ret_y_ptrs), ret_y_handles, world);
+
+    const size_t ch_off = static_cast<size_t>(channel) * static_cast<size_t>(MAX_RANKS) * sizeof(void*);
+    const size_t ch_off_i = static_cast<size_t>(channel) * sizeof(int);
+    const size_t ch_off_ip = static_cast<size_t>(channel) * static_cast<size_t>(MAX_RANKS) * sizeof(int*);
+    cudaMemcpyToSymbol(d_infer_barrier_signal_ptrs, st.barrier_signal_ptrs, world * sizeof(int*), ch_off_ip, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_x_fp8_ptrs, st.recv_x_fp8_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_x_scale_ptrs, st.recv_x_scale_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_idx_ptrs, st.recv_topk_idx_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_w_ptrs, st.recv_topk_w_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_ret_y_ptrs, st.ret_y_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+
+    cudaMemcpyToSymbol(d_infer_rank, &st.rank, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_world, &st.world, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_T_cap, &st.T_cap, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_H, &st.H, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_Hsf, &st.Hsf, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_K, &st.K, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_n_local, &st.n_local, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_expert_placement, &st.expert_placement, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+
+    st.initialized = true;
+}
+
+extern "C" void rdep_infer_init_ipc_fp8_local(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* barrier_handles,
+    const void* recv_x_fp8_handles,
+    const void* recv_x_scale_handles,
+    const void* recv_topk_idx_handles,
+    const void* recv_topk_w_handles,
+    const void* ret_y_handles,
+    void* local_barrier,
+    void* local_recv_x_fp8,
+    void* local_recv_x_scale,
+    void* local_recv_topk_idx,
+    void* local_recv_topk_w,
+    void* local_ret_y)
+{
+    cudaSetDevice(rank);
+    cudaFree(nullptr);
+
+    if (world > MAX_RANKS) {
+        printf("rdep_infer_init_ipc_fp8_local: world=%d exceeds MAX_RANKS=%d\n", world, MAX_RANKS);
+        std::abort();
+    }
+    if (channel < 0 || channel >= INFER_CHANNELS) {
+        printf("rdep_infer_init_ipc_fp8_local: invalid channel=%d\n", channel);
+        std::abort();
+    }
+    if (expert_placement != INFER_EXPERT_PLACEMENT_CONTIGUOUS && expert_placement != INFER_EXPERT_PLACEMENT_STRIPED) {
+        printf("rdep_infer_init_ipc_fp8_local: invalid expert_placement=%d\n", expert_placement);
+        std::abort();
+    }
+    InferState& st = g_infer[channel];
+    st.rank = rank;
+    st.world = world;
+    st.T_cap = T_cap;
+    st.H = H;
+    st.Hsf = H / 128;
+    st.K = K;
+    st.n_local = n_local;
+    st.expert_placement = expert_placement;
+
+    open_ipc_ptrs_with_local(reinterpret_cast<void**>(st.barrier_signal_ptrs), barrier_handles, world, rank, local_barrier);
+    open_ipc_ptrs_with_local(reinterpret_cast<void**>(st.recv_x_fp8_ptrs), recv_x_fp8_handles, world, rank, local_recv_x_fp8);
+    open_ipc_ptrs_with_local(reinterpret_cast<void**>(st.recv_x_scale_ptrs), recv_x_scale_handles, world, rank, local_recv_x_scale);
+    open_ipc_ptrs_with_local(reinterpret_cast<void**>(st.recv_topk_idx_ptrs), recv_topk_idx_handles, world, rank, local_recv_topk_idx);
+    open_ipc_ptrs_with_local(reinterpret_cast<void**>(st.recv_topk_w_ptrs), recv_topk_w_handles, world, rank, local_recv_topk_w);
+    open_ipc_ptrs_with_local(reinterpret_cast<void**>(st.ret_y_ptrs), ret_y_handles, world, rank, local_ret_y);
+
+    const size_t ch_off = static_cast<size_t>(channel) * static_cast<size_t>(MAX_RANKS) * sizeof(void*);
+    const size_t ch_off_i = static_cast<size_t>(channel) * sizeof(int);
+    const size_t ch_off_ip = static_cast<size_t>(channel) * static_cast<size_t>(MAX_RANKS) * sizeof(int*);
+    cudaMemcpyToSymbol(d_infer_barrier_signal_ptrs, st.barrier_signal_ptrs, world * sizeof(int*), ch_off_ip, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_x_fp8_ptrs, st.recv_x_fp8_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_x_scale_ptrs, st.recv_x_scale_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_idx_ptrs, st.recv_topk_idx_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_w_ptrs, st.recv_topk_w_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_ret_y_ptrs, st.ret_y_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+
+    cudaMemcpyToSymbol(d_infer_rank, &st.rank, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_world, &st.world, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_T_cap, &st.T_cap, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_H, &st.H, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_Hsf, &st.Hsf, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_K, &st.K, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_n_local, &st.n_local, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_expert_placement, &st.expert_placement, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+
+    st.initialized = true;
+}
+
+extern "C" void rdep_infer_init_ipc_storage_fp8(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* recv_x_fp8_handles,
+    const int64_t* recv_x_fp8_off_bytes,
+    const void* recv_x_scale_handles,
+    const int64_t* recv_x_scale_off_bytes,
+    const void* recv_topk_idx_handles,
+    const int64_t* recv_topk_idx_off_bytes,
+    const void* recv_topk_w_handles,
+    const int64_t* recv_topk_w_off_bytes,
+    const void* ret_y_handles,
+    const int64_t* ret_y_off_bytes)
+{
+    cudaSetDevice(rank);
+    cudaFree(nullptr);
+
+    if (world > MAX_RANKS) {
+        printf("rdep_infer_init_ipc_storage_fp8: world=%d exceeds MAX_RANKS=%d\n", world, MAX_RANKS);
+        std::abort();
+    }
+    if (channel < 0 || channel >= INFER_CHANNELS) {
+        printf("rdep_infer_init_ipc_storage_fp8: invalid channel=%d\n", channel);
+        std::abort();
+    }
+    if (expert_placement != INFER_EXPERT_PLACEMENT_CONTIGUOUS && expert_placement != INFER_EXPERT_PLACEMENT_STRIPED) {
+        printf("rdep_infer_init_ipc_storage_fp8: invalid expert_placement=%d\n", expert_placement);
+        std::abort();
+    }
+    InferState& st = g_infer[channel];
+    st.rank = rank;
+    st.world = world;
+    st.T_cap = T_cap;
+    st.H = H;
+    st.Hsf = H / 128;
+    st.K = K;
+    st.n_local = n_local;
+    st.expert_placement = expert_placement;
+
+    open_ipc_ptrs_with_offset(reinterpret_cast<void**>(st.recv_x_fp8_ptrs), recv_x_fp8_handles, recv_x_fp8_off_bytes, world);
+    open_ipc_ptrs_with_offset(reinterpret_cast<void**>(st.recv_x_scale_ptrs), recv_x_scale_handles, recv_x_scale_off_bytes, world);
+    open_ipc_ptrs_with_offset(reinterpret_cast<void**>(st.recv_topk_idx_ptrs), recv_topk_idx_handles, recv_topk_idx_off_bytes, world);
+    open_ipc_ptrs_with_offset(reinterpret_cast<void**>(st.recv_topk_w_ptrs), recv_topk_w_handles, recv_topk_w_off_bytes, world);
+    open_ipc_ptrs_with_offset(reinterpret_cast<void**>(st.ret_y_ptrs), ret_y_handles, ret_y_off_bytes, world);
+
+    const size_t ch_off = static_cast<size_t>(channel) * static_cast<size_t>(MAX_RANKS) * sizeof(void*);
+    const size_t ch_off_i = static_cast<size_t>(channel) * sizeof(int);
+    cudaMemcpyToSymbol(d_infer_recv_x_fp8_ptrs, st.recv_x_fp8_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_x_scale_ptrs, st.recv_x_scale_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_idx_ptrs, st.recv_topk_idx_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_w_ptrs, st.recv_topk_w_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_ret_y_ptrs, st.ret_y_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+
+    cudaMemcpyToSymbol(d_infer_rank, &st.rank, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_world, &st.world, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_T_cap, &st.T_cap, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_H, &st.H, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_Hsf, &st.Hsf, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_K, &st.K, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_n_local, &st.n_local, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_expert_placement, &st.expert_placement, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+
+    st.initialized = true;
+}
+
+extern "C" void rdep_infer_init_ipc_slab_fp8_local(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* slab_handles,
+    const int64_t* slab_off_bytes,
+    void* local_slab_ptr)
+{
+    cudaSetDevice(rank);
+    cudaFree(nullptr);
+
+    if (world > MAX_RANKS) {
+        printf("rdep_infer_init_ipc_slab_fp8_local: world=%d exceeds MAX_RANKS=%d\n", world, MAX_RANKS);
+        std::abort();
+    }
+    if (channel < 0 || channel >= INFER_CHANNELS) {
+        printf("rdep_infer_init_ipc_slab_fp8_local: invalid channel=%d\n", channel);
+        std::abort();
+    }
+    if (slab_handles == nullptr || slab_off_bytes == nullptr || local_slab_ptr == nullptr) {
+        printf("rdep_infer_init_ipc_slab_fp8_local: inputs must be non-null\n");
+        std::abort();
+    }
+    if (expert_placement != INFER_EXPERT_PLACEMENT_CONTIGUOUS && expert_placement != INFER_EXPERT_PLACEMENT_STRIPED) {
+        printf("rdep_infer_init_ipc_slab_fp8_local: invalid expert_placement=%d\n", expert_placement);
+        std::abort();
+    }
+
+    // Offsets: [barrier, recv_x_fp8, recv_x_scale, recv_topk_idx, recv_topk_w, ret_y]
+    const int64_t off_bar = slab_off_bytes[0];
+    const int64_t off_xq = slab_off_bytes[1];
+    const int64_t off_xs = slab_off_bytes[2];
+    const int64_t off_ti = slab_off_bytes[3];
+    const int64_t off_tw = slab_off_bytes[4];
+    const int64_t off_ry = slab_off_bytes[5];
+
+    InferState& st = g_infer[channel];
+    st.rank = rank;
+    st.world = world;
+    st.T_cap = T_cap;
+    st.H = H;
+    st.Hsf = H / 128;
+    st.K = K;
+    st.n_local = n_local;
+    st.expert_placement = expert_placement;
+
+    // Open one slab handle per peer and derive per-buffer pointers via offsets.
+    const uint8_t* h = reinterpret_cast<const uint8_t*>(slab_handles);
+    for (int r = 0; r < world; ++r) {
+        void* base = nullptr;
+        if (r == rank) {
+            base = local_slab_ptr;
+        } else {
+            cudaIpcMemHandle_t memh;
+            memcpy(&memh, h + r * sizeof(cudaIpcMemHandle_t), sizeof(cudaIpcMemHandle_t));
+            cudaError_t err = cudaIpcOpenMemHandle(&base, memh, cudaIpcMemLazyEnablePeerAccess);
+            if (err != cudaSuccess) {
+                printf("rdep_infer_init_ipc_slab_fp8_local: cudaIpcOpenMemHandle failed for rank=%d: %s\n", r, cudaGetErrorString(err));
+                std::abort();
+            }
+        }
+        auto* b = reinterpret_cast<uint8_t*>(base);
+        st.barrier_signal_ptrs[r] = reinterpret_cast<int*>(b + off_bar);
+        st.recv_x_fp8_ptrs[r] = reinterpret_cast<void*>(b + off_xq);
+        st.recv_x_scale_ptrs[r] = reinterpret_cast<void*>(b + off_xs);
+        st.recv_topk_idx_ptrs[r] = reinterpret_cast<void*>(b + off_ti);
+        st.recv_topk_w_ptrs[r] = reinterpret_cast<void*>(b + off_tw);
+        st.ret_y_ptrs[r] = reinterpret_cast<void*>(b + off_ry);
+    }
+
+    const size_t ch_off = static_cast<size_t>(channel) * static_cast<size_t>(MAX_RANKS) * sizeof(void*);
+    const size_t ch_off_i = static_cast<size_t>(channel) * sizeof(int);
+    const size_t ch_off_ip = static_cast<size_t>(channel) * static_cast<size_t>(MAX_RANKS) * sizeof(int*);
+    cudaMemcpyToSymbol(d_infer_barrier_signal_ptrs, st.barrier_signal_ptrs, world * sizeof(int*), ch_off_ip, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_x_fp8_ptrs, st.recv_x_fp8_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_x_scale_ptrs, st.recv_x_scale_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_idx_ptrs, st.recv_topk_idx_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_w_ptrs, st.recv_topk_w_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_ret_y_ptrs, st.ret_y_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+
+    cudaMemcpyToSymbol(d_infer_rank, &st.rank, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_world, &st.world, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_T_cap, &st.T_cap, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_H, &st.H, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_Hsf, &st.Hsf, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_K, &st.K, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_n_local, &st.n_local, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_expert_placement, &st.expert_placement, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+
+    st.initialized = true;
+}
+
+extern "C" void rdep_infer_init_ptrs_fp8(
+    int channel,
+    int rank,
+    int world,
+    int T_cap,
+    int H,
+    int K,
+    int n_local,
+    int expert_placement,
+    const void* barrier_ptrs_u64,
+    const void* recv_x_fp8_ptrs_u64,
+    const void* recv_x_scale_ptrs_u64,
+    const void* recv_topk_idx_ptrs_u64,
+    const void* recv_topk_w_ptrs_u64,
+    const void* ret_y_ptrs_u64)
+{
+    cudaSetDevice(rank);
+    cudaFree(nullptr);
+
+    if (world > MAX_RANKS) {
+        printf("rdep_infer_init_ptrs_fp8: world=%d exceeds MAX_RANKS=%d\n", world, MAX_RANKS);
+        std::abort();
+    }
+    if (channel < 0 || channel >= INFER_CHANNELS) {
+        printf("rdep_infer_init_ptrs_fp8: invalid channel=%d\n", channel);
+        std::abort();
+    }
+    if (expert_placement != INFER_EXPERT_PLACEMENT_CONTIGUOUS && expert_placement != INFER_EXPERT_PLACEMENT_STRIPED) {
+        printf("rdep_infer_init_ptrs_fp8: invalid expert_placement=%d\n", expert_placement);
+        std::abort();
+    }
+    InferState& st = g_infer[channel];
+    st.rank = rank;
+    st.world = world;
+    st.T_cap = T_cap;
+    st.H = H;
+    st.Hsf = H / 128;
+    st.K = K;
+    st.n_local = n_local;
+    st.expert_placement = expert_placement;
+
+    const uint64_t* b = reinterpret_cast<const uint64_t*>(barrier_ptrs_u64);
+    const uint64_t* xq = reinterpret_cast<const uint64_t*>(recv_x_fp8_ptrs_u64);
+    const uint64_t* xs = reinterpret_cast<const uint64_t*>(recv_x_scale_ptrs_u64);
+    const uint64_t* ti = reinterpret_cast<const uint64_t*>(recv_topk_idx_ptrs_u64);
+    const uint64_t* tw = reinterpret_cast<const uint64_t*>(recv_topk_w_ptrs_u64);
+    const uint64_t* ry = reinterpret_cast<const uint64_t*>(ret_y_ptrs_u64);
+
+    for (int r = 0; r < world; ++r) {
+        st.barrier_signal_ptrs[r] = reinterpret_cast<int*>(static_cast<uintptr_t>(b[r]));
+        st.recv_x_fp8_ptrs[r] = reinterpret_cast<void*>(static_cast<uintptr_t>(xq[r]));
+        st.recv_x_scale_ptrs[r] = reinterpret_cast<void*>(static_cast<uintptr_t>(xs[r]));
+        st.recv_topk_idx_ptrs[r] = reinterpret_cast<void*>(static_cast<uintptr_t>(ti[r]));
+        st.recv_topk_w_ptrs[r] = reinterpret_cast<void*>(static_cast<uintptr_t>(tw[r]));
+        st.ret_y_ptrs[r] = reinterpret_cast<void*>(static_cast<uintptr_t>(ry[r]));
+    }
+
+    const size_t ch_off = static_cast<size_t>(channel) * static_cast<size_t>(MAX_RANKS) * sizeof(void*);
+    const size_t ch_off_i = static_cast<size_t>(channel) * sizeof(int);
+    const size_t ch_off_ip = static_cast<size_t>(channel) * static_cast<size_t>(MAX_RANKS) * sizeof(int*);
+    cudaMemcpyToSymbol(d_infer_barrier_signal_ptrs, st.barrier_signal_ptrs, world * sizeof(int*), ch_off_ip, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_x_fp8_ptrs, st.recv_x_fp8_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_x_scale_ptrs, st.recv_x_scale_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_idx_ptrs, st.recv_topk_idx_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_recv_topk_w_ptrs, st.recv_topk_w_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_ret_y_ptrs, st.ret_y_ptrs, world * sizeof(void*), ch_off, cudaMemcpyHostToDevice);
+
+    cudaMemcpyToSymbol(d_infer_rank, &st.rank, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_world, &st.world, sizeof(int), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_T_cap, &st.T_cap, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_H, &st.H, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_Hsf, &st.Hsf, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_K, &st.K, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_n_local, &st.n_local, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_infer_expert_placement, &st.expert_placement, sizeof(int), ch_off_i, cudaMemcpyHostToDevice);
+
+    st.initialized = true;
 }
 
 // ============================================================================
@@ -3759,6 +4724,40 @@ __global__ void k_ipc_barrier_phase_block(int phase) {
         }
     }
     __syncthreads();
+}
+
+// Graph-replay-safe IPC barrier (tag-based, DeepEP-style atomic add/sub).
+//
+// Unlike the phase barrier above, this does not require a monotonically
+// increasing host-controlled phase value. Each call returns signals to zero,
+// so it can be safely placed inside a CUDA graph replay loop.
+__global__ void k_ipc_barrier_tag_bf16() {
+    barrier_block_dynamic(d_barrier_signal_ptrs_bf16, d_my_rank_bf16, d_world_bf16);
+}
+
+__global__ void k_ipc_barrier_zero_bf16() {
+    int tid = threadIdx.x;
+    int world = d_world_bf16;
+    int my_rank = d_my_rank_bf16;
+    if (tid < world) {
+        d_barrier_signal_ptrs_bf16[my_rank][tid] = 0;
+    }
+}
+
+extern "C" void rdep_ipc_barrier_phase_bf16(cudaStream_t stream) {
+    ipc_barrier_bf16(stream);
+}
+
+extern "C" void rdep_ipc_barrier_tag_bf16(cudaStream_t stream) {
+    if (g_mode != MODE_IPC) return;
+    if (g_bf16.world <= 1) return;
+    k_ipc_barrier_tag_bf16<<<1, 256, 0, stream>>>();
+}
+
+extern "C" void rdep_ipc_barrier_zero_bf16(cudaStream_t stream) {
+    if (g_mode != MODE_IPC) return;
+    if (g_bf16.world <= 1) return;
+    k_ipc_barrier_zero_bf16<<<1, 256, 0, stream>>>();
 }
 
 __global__ void k_stage_dy_to_xbuf_bf16(

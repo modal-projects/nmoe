@@ -75,6 +75,7 @@ endif
 
 # Targets (.so files stay in csrc/, imported as nmoe.csrc.*)
 RDEP_TARGET := rdep$(PYTHON_EXT_SUFFIX)
+INFER_IPC_TARGET := infer_ipc$(PYTHON_EXT_SUFFIX)
 GPU_TARGET := gpu$(PYTHON_EXT_SUFFIX)
 # Place muon under opt/ subpackage
 OPT_DIR := opt
@@ -101,6 +102,18 @@ FLASHMLA_CPP_OBJS := flashmla_sm100_bindings.o
 
 TORCH_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension import include_paths; print(' '.join(['-isystem '+p for p in include_paths()]))")
 TORCH_LIB_DIR := $(shell $(PYTHON) -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+
+INFER_IPC_CXX_FLAGS := -DTORCH_EXTENSION_NAME=infer_ipc -DTORCH_API_INCLUDE_EXTENSION_H \
+	-std=c++17 -O3 -fPIC \
+	$(TORCH_INCLUDE_FLAGS) \
+	-isystem $(CUDA_HOME)/include \
+	-isystem $(PYTHON_INCLUDE) \
+	-I$(PYBIND11_INCLUDE)
+
+INFER_IPC_LDFLAGS := -shared \
+	-L$(TORCH_LIB_DIR) -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python \
+	-L$(CUDA_HOME)/lib64 -lcudart \
+	-Wl,-rpath,$(TORCH_LIB_DIR) -Wl,-rpath,$(CUDA_HOME)/lib64
 
 FLASHMLA_CXX_FLAGS := -DTORCH_EXTENSION_NAME=flashmla_sm100 -DTORCH_API_INCLUDE_EXTENSION_H \
 	-std=c++17 -O3 -fPIC \
@@ -179,6 +192,17 @@ $(FLASHMLA_TARGET): $(FLASHMLA_BWD_OBJ) $(FLASHMLA_CPP_OBJS)
 	@echo ""
 	@echo "Built $(FLASHMLA_TARGET)"
 	@echo ""
+
+# ========== Inference IPC buffer allocator (torch-linked, CUDA) ==========
+
+$(INFER_IPC_TARGET): infer_ipc_tensors.o
+	$(CXX) -o $@ $^ $(INFER_IPC_LDFLAGS)
+	@echo ""
+	@echo "Built $(INFER_IPC_TARGET)"
+	@echo ""
+
+infer_ipc_tensors.o: infer_ipc_tensors.cpp
+	$(CXX) $(INFER_IPC_CXX_FLAGS) -c $< -o $@
 
 rdep.o: rdep.cu ptx.cu rdep_nvshmem.cuh
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
