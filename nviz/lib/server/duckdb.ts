@@ -1,11 +1,11 @@
-// Server-only metrics readers backed by DuckDB.
+// Server-only metrics readers backed by DuckDB reading parquet files.
 //
-// nmoe writes per-rank DuckDB metrics files:
-//   /data/metrics/{run_id}/rank_{rank}.duckdb
+// nmoe writes per-step parquet files (rank 0 only):
+//   /data/metrics/{run_id}/step_XXXXXXXX.parquet
 //
-// NVIZ attaches all rank DBs for a run (read-only) and queries them with
-// window functions to dedupe and downsample efficiently.
-import { readdirSync } from 'node:fs'
+// NVIZ queries them via DuckDB's read_parquet glob for real-time access
+// (no file locking issues unlike attached duckdb files).
+import { readdirSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 import { DuckDBInstance } from '@duckdb/node-api'
@@ -45,40 +45,48 @@ function listRunDirs(dir: string): string[] {
   }
 }
 
-function listDuckdbFilesForRun(dir: string, run: string): string[] {
-  const runDir = safeRunDir(dir, run)
+function hasParquetFiles(dir: string, run: string): boolean {
   try {
+    const runDir = safeRunDir(dir, run)
     const files = readdirSync(runDir, { withFileTypes: true })
-      .filter((e) => e.isFile() && e.name.endsWith('.duckdb'))
-      .map((e) => join(runDir, e.name))
-    // Prefer rank_*.duckdb (ignore any other *.duckdb artifacts).
-    return files.filter((p) => /\/rank_\d+\.duckdb$/.test(p)).sort()
+    return files.some((e) => e.isFile() && e.name.startsWith('step_') && e.name.endsWith('.parquet'))
   } catch {
-    return []
+    return false
   }
 }
 
-function representativeDuckdbFile(dir: string, run: string): string | null {
-  const files = listDuckdbFilesForRun(dir, run)
-  if (files.length === 0) return null
-  const rank0 = files.find((p) => p.endsWith('/rank_0.duckdb'))
-  return rank0 || files[0] || null
+function newestParquetMtime(dir: string, run: string): number {
+  try {
+    const runDir = safeRunDir(dir, run)
+    const files = readdirSync(runDir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.startsWith('step_') && e.name.endsWith('.parquet'))
+    let newest = 0
+    for (const f of files) {
+      try {
+        const st = statSync(join(runDir, f.name))
+        if (st.mtimeMs > newest) newest = st.mtimeMs
+      } catch {}
+    }
+    return newest
+  } catch {
+    return 0
+  }
 }
 
-async function withRunAttached<T>(run: string, fn: (aliases: string[], q: (sql: string) => Promise<any[]>) => Promise<T>): Promise<T> {
+function parquetGlob(dir: string, run: string): string {
+  const runDir = safeRunDir(dir, run)
+  return join(runDir, 'step_*.parquet')
+}
+
+async function withParquetView<T>(run: string, fn: (q: (sql: string) => Promise<any[]>) => Promise<T>): Promise<T> {
   const dir = metricsDir()
-  const files = listDuckdbFilesForRun(dir, run)
-  if (files.length === 0) return await fn([], async () => [])
+  if (!hasParquetFiles(dir, run)) return await fn(async () => [])
 
   const inst = await DuckDBInstance.create(':memory:')
   const conn = await inst.connect()
   try {
-    const aliases: string[] = []
-    for (let i = 0; i < files.length; i++) {
-      const alias = `r${i}`
-      aliases.push(alias)
-      await conn.run(`ATTACH ${sqlLit(files[i])} AS ${alias} (READ_ONLY);`)
-    }
+    const glob = parquetGlob(dir, run)
+    await conn.run(`CREATE VIEW metrics AS SELECT * FROM read_parquet(${sqlLit(glob)}, union_by_name=true, filename=false)`)
 
     const q = async (sql: string): Promise<any[]> => {
       const reader = await conn.runAndReadAll(sql)
@@ -87,16 +95,11 @@ async function withRunAttached<T>(run: string, fn: (aliases: string[], q: (sql: 
       return rows.map((r: any[]) => Object.fromEntries(cols.map((c, i) => [c, r[i]])))
     }
 
-    return await fn(aliases, q)
+    return await fn(q)
   } finally {
     try { (conn as any).close?.() } catch {}
     try { (inst as any).close?.() } catch {}
   }
-}
-
-function unionSql(aliases: string[], select: string): string {
-  if (aliases.length === 0) return 'SELECT NULL AS run, NULL AS tag, NULL::INTEGER AS step, NULL::BIGINT AS ts_ms, NULL::DOUBLE AS value WHERE FALSE'
-  return aliases.map((a) => select.replaceAll('$DB', a)).join('\nUNION ALL\n')
 }
 
 let allRunsCache: { at_ms: number; runs: RunSummary[] } | null = null
@@ -111,13 +114,13 @@ export async function allRuns(): Promise<RunSummary[]> {
   const runs = listRunDirs(dir)
   const out: RunSummary[] = []
   for (const run of runs) {
-    const file = representativeDuckdbFile(dir, run)
-    if (!file) continue
+    if (!hasParquetFiles(dir, run)) continue
     const inst = await DuckDBInstance.create(':memory:')
     const conn = await inst.connect()
     try {
-      await conn.run(`ATTACH ${sqlLit(file)} AS r0 (READ_ONLY);`)
-      const reader = await conn.runAndReadAll(`SELECT max(ts_ms) AS last_ts, max(step) AS last_step FROM r0.metrics`)
+      const glob = parquetGlob(dir, run)
+      await conn.run(`CREATE VIEW metrics AS SELECT * FROM read_parquet(${sqlLit(glob)}, union_by_name=true, filename=false)`)
+      const reader = await conn.runAndReadAll(`SELECT max(ts_ms) AS last_ts, max(step) AS last_step FROM metrics`)
       const rows = reader.getRows()
       const last_ts = Number(rows?.[0]?.[0] ?? 0)
       const last_step = Number(rows?.[0]?.[1] ?? 0)
@@ -134,13 +137,12 @@ export async function allRuns(): Promise<RunSummary[]> {
 
 export async function latestForTags(run: string, tags: string[]): Promise<Record<string, number>> {
   if (tags.length === 0) return {}
-  return await withRunAttached(run, async (aliases, q) => {
+  return await withParquetView(run, async (q) => {
     const inList = tags.map(sqlLit).join(',')
-    const u = unionSql(aliases, `SELECT run, tag, step, ts_ms, value FROM $DB.metrics WHERE run = ${sqlLit(run)} AND tag IN (${inList})`)
     const rows = await q(`
-      WITH u AS (${u})
       SELECT tag, value
-      FROM u
+      FROM metrics
+      WHERE run = ${sqlLit(run)} AND tag IN (${inList})
       QUALIFY row_number() OVER (PARTITION BY tag ORDER BY ts_ms DESC, step DESC) = 1
     `)
     const out: Record<string, number> = {}
@@ -151,13 +153,12 @@ export async function latestForTags(run: string, tags: string[]): Promise<Record
 
 export async function latestForPrefixes(run: string, prefixes: string[]): Promise<Record<string, number>> {
   if (prefixes.length === 0) return {}
-  return await withRunAttached(run, async (aliases, q) => {
+  return await withParquetView(run, async (q) => {
     const where = prefixes.map((p) => `tag LIKE ${sqlLit(p + '%')}`).join(' OR ')
-    const u = unionSql(aliases, `SELECT run, tag, step, ts_ms, value FROM $DB.metrics WHERE run = ${sqlLit(run)} AND (${where})`)
     const rows = await q(`
-      WITH u AS (${u})
-      SELECT tag, value, ts_ms, step
-      FROM u
+      SELECT tag, value
+      FROM metrics
+      WHERE run = ${sqlLit(run)} AND (${where})
       QUALIFY row_number() OVER (PARTITION BY tag ORDER BY ts_ms DESC, step DESC) = 1
     `)
     const out: Record<string, number> = {}
@@ -168,13 +169,12 @@ export async function latestForPrefixes(run: string, prefixes: string[]): Promis
 
 export async function scalarsSampled(run: string, tag: string, buckets: number): Promise<Array<{ step: number; ts_ms: number; value: number }>> {
   const n = Math.max(8, Math.min(buckets, 20000))
-  return await withRunAttached(run, async (aliases, q) => {
-    const u = unionSql(aliases, `SELECT run, tag, step, ts_ms, value FROM $DB.metrics WHERE run = ${sqlLit(run)} AND tag = ${sqlLit(tag)}`)
+  return await withParquetView(run, async (q) => {
     const rows = await q(`
-      WITH u AS (${u}),
-      dedup AS (
+      WITH dedup AS (
         SELECT step, ts_ms, value
-        FROM u
+        FROM metrics
+        WHERE run = ${sqlLit(run)} AND tag = ${sqlLit(tag)}
         QUALIFY row_number() OVER (PARTITION BY step ORDER BY ts_ms DESC) = 1
       ),
       bucketed AS (

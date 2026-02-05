@@ -9,7 +9,7 @@ publication-friendly SVG heatmaps of layer alignment (Engram-style):
   - Values: linear CKA similarity (higher is better)
 
 Run:
-  python -m nmoe.physics.viz_cka --runs /tmp/arch_ablations
+  python -m nmoe.research.physics.viz_cka --runs /tmp/arch_ablations
 """
 
 from __future__ import annotations

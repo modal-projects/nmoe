@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 from importlib import import_module
 
 import torch
@@ -9,10 +9,10 @@ from torch.profiler import record_function
 import torch.distributed as dist
 
 from nmoe.attention.rope import RotaryEmbedding
-from nmoe.rdep import Rdep
-from nmoe.blockscaled.grouped import quantize_weights
 from nmoe.norm import RMSNorm
-from nmoe.mtp import MTP
+
+if TYPE_CHECKING:
+  from nmoe.rdep import Rdep
 
 
 ATTN = {
@@ -21,6 +21,7 @@ ATTN = {
   "nsa": "nmoe.attention.nsa.NSA",
   "dsa": "nmoe.attention.dsa.DSA",
   "kda": "nmoe.attention.kda.KDA",
+  "sdpa": "nmoe.attention.sdpa.SDPA",
 }
 
 
@@ -33,20 +34,33 @@ def get_attention(name: str):
 
 
 class MLP(nn.Module):
-  def __init__(self, dim: int, inter_dim: int):
+  def __init__(self, dim: int, inter_dim: int, activation: str = "swiglu"):
     super().__init__()
+    self.activation = activation
     self.w1 = nn.Linear(dim, inter_dim, bias=False, dtype=torch.bfloat16)
-    self.w3 = nn.Linear(dim, inter_dim, bias=False, dtype=torch.bfloat16)
+    # relu_squared doesn't use w3 (2-weight architecture)
+    if activation != "relu_squared":
+      self.w3 = nn.Linear(dim, inter_dim, bias=False, dtype=torch.bfloat16)
+    else:
+      self.w3 = None
     self.w2 = nn.Linear(inter_dim, dim, bias=False, dtype=torch.bfloat16)
 
   def init_weights(self, init_std: float = 0.02):
     nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
-    nn.init.trunc_normal_(self.w3.weight, mean=0.0, std=0.02)
+    if self.w3 is not None:
+      nn.init.trunc_normal_(self.w3.weight, mean=0.0, std=0.02)
     nn.init.trunc_normal_(self.w2.weight, mean=0.0, std=init_std)
 
   @record_function("mlp")
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    return self.w2(F.silu(self.w1(x)) * self.w3(x))
+    if self.activation == "swiglu":
+      return self.w2(F.silu(self.w1(x)) * self.w3(x))
+    elif self.activation == "relu_squared":
+      return self.w2(F.relu(self.w1(x)) ** 2)
+    elif self.activation == "squared_reglu":
+      return self.w2(F.relu(self.w1(x)) ** 2 * self.w3(x))
+    else:
+      raise ValueError(f"Unknown activation: {self.activation}")
 
 
 class Router(nn.Module):
@@ -55,6 +69,8 @@ class Router(nn.Module):
     self.n_experts = config.n_routed_experts
     self.topk = config.n_activated_experts
     self.route_scale = getattr(config, 'route_scale', 1.0)
+    # Post-normalization scaling for gradient flow (NVFP4 only, DeepSeek-V3 uses 2.5)
+    self.routed_scaling_factor = getattr(config, 'routed_scaling_factor', 1.0)
     self.gate = nn.Linear(config.dim, self.n_experts, bias=False, dtype=torch.bfloat16)
     self.register_buffer("bias", torch.zeros(self.n_experts, dtype=torch.float32))
 
@@ -68,6 +84,9 @@ class Router(nn.Module):
     _, indices = torch.topk(scores_for_selection, k=self.topk, dim=-1)
     weights = torch.gather(scores, 1, indices)
     weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    # Post-normalization scaling boosts gradient flow through experts (NVFP4)
+    if self.routed_scaling_factor != 1.0:
+      weights = weights * self.routed_scaling_factor
     return weights.to(x.dtype), indices
 
   @torch.no_grad()
@@ -90,20 +109,28 @@ class MoE(nn.Module):
     self.n_local = rdep.n_local
     self.K = rdep.topk
     self.router = Router(cfg)
+    self._activation = getattr(cfg, 'activation', 'swiglu')
     self.W1 = nn.Parameter(torch.empty(self.n_local, self.dim, self.moe_inter_dim, dtype=torch.bfloat16))
-    self.W3 = nn.Parameter(torch.empty(self.n_local, self.dim, self.moe_inter_dim, dtype=torch.bfloat16))
+    # relu_squared doesn't use W3 (2-weight architecture)
+    if self._activation != "relu_squared":
+      self.W3 = nn.Parameter(torch.empty(self.n_local, self.dim, self.moe_inter_dim, dtype=torch.bfloat16))
+    else:
+      self.register_parameter('W3', None)
     self.W2 = nn.Parameter(torch.empty(self.n_local, self.moe_inter_dim, self.dim, dtype=torch.bfloat16))
     self._dtype = getattr(cfg, 'dtype', 'nvfp4')
     self._use_blockscaled = self._dtype in ('fp8', 'nvfp4')
     self._W_cache = None  # QuantizedWeightsFused cache, refreshed after each optimizer step
     n_shared = getattr(cfg, 'n_shared_experts', 0)
-    self._shared = MLP(self.dim, n_shared * self.moe_inter_dim) if n_shared else None
+    activation = getattr(cfg, 'activation', 'swiglu')
+    self._shared = MLP(self.dim, n_shared * self.moe_inter_dim, activation=activation) if n_shared else None
     self.last_loads = None
     self.last_aux_loss = None
 
   def init_weights(self, init_std: float = 0.02):
-    for W in (self.W1, self.W3, self.W2):
-      nn.init.trunc_normal_(W, mean=0.0, std=init_std)
+    nn.init.trunc_normal_(self.W1, mean=0.0, std=init_std)
+    if self.W3 is not None:
+      nn.init.trunc_normal_(self.W3, mean=0.0, std=init_std)
+    nn.init.trunc_normal_(self.W2, mean=0.0, std=init_std)
     self.router.init_weights(init_std)
     if self._shared:
       self._shared.init_weights(init_std)
@@ -114,25 +141,43 @@ class MoE(nn.Module):
   def refresh_weight_cache(self):
     """Refresh quantized weight cache. Call after optimizer step."""
     if self._use_blockscaled:
-      self._W_cache = quantize_weights(self.W1, self.W3, self.W2, profile=self._dtype)
+      # Blockscaled kernels are SM100-only; keep import lazy so bf16/dense runs
+      # don't depend on blockscaled stack.
+      from nmoe.blockscaled.grouped import quantize_weights
+      W3 = self.W3 if self.W3 is not None else self.W1  # dummy for relu_squared
+      self._W_cache = quantize_weights(self.W1, W3, self.W2, profile=self._dtype)
 
   @record_function("moe")
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     X = x.view(-1, x.size(-1))
     T = X.size(0)
     g, eid = self.router(X)
-    with torch.no_grad():
-      loads = torch.bincount(eid.reshape(-1), minlength=self.router.n_experts).to(torch.float32)
-      self.last_loads = loads
-      self.last_aux_loss = loads.new_zeros(())
 
+    # Load counts (non-differentiable, for metrics/bias updates)
+    E = self.router.n_experts
+    with torch.no_grad():
+      loads = torch.bincount(eid.reshape(-1), minlength=E).to(torch.float32)
+      self.last_loads = loads
+
+    # Switch-style aux loss: E * sum((importance/Σimportance) * (load/Σload))
+    # Differentiable through g (router weights), provides gradient signal for balance.
+    importance = torch.zeros(E, device=g.device, dtype=torch.float32)
+    importance.scatter_add_(0, eid.reshape(-1), g.reshape(-1).float())
+    load_frac = loads / loads.sum().clamp(min=1.0)
+    importance_frac = importance / importance.sum().clamp(min=1e-12)
+    self.last_aux_loss = E * (importance_frac * load_frac).sum()
+
+    W3 = self.W3 if self.W3 is not None else self.W1  # dummy for relu_squared
     if self._use_blockscaled:
       if self._W_cache is None:
-        self._W_cache = quantize_weights(self.W1, self.W3, self.W2, profile=self._dtype)
+        # Blockscaled kernels are SM100-only; keep import lazy so bf16/dense runs
+        # don't depend on blockscaled stack.
+        from nmoe.blockscaled.grouped import quantize_weights
+        self._W_cache = quantize_weights(self.W1, W3, self.W2, profile=self._dtype)
 
-      out = self._rdep.moe_blockscaled(X.bfloat16(), eid, g, self.W1, self.W3, self.W2, self._W_cache)
+      out = self._rdep.moe_blockscaled(X.bfloat16(), eid, g, self.W1, W3, self.W2, self._W_cache, self._activation)
     else:
-      out = self._rdep.moe_bf16(X.bfloat16(), eid, g, self.W1, self.W3, self.W2)
+      out = self._rdep.moe_bf16(X.bfloat16(), eid, g, self.W1, W3, self.W2, self._activation)
 
     if self._shared:
       out = out + self._shared(X)
@@ -165,8 +210,9 @@ class TransformerBlock(nn.Module):
         )
       self.attn.window = window
     self.is_moe = layer_id >= config.n_dense_layers
+    activation = getattr(config, 'activation', 'swiglu')
     if layer_id < config.n_dense_layers:
-      self.ffn = MLP(dim=config.dim, inter_dim=config.inter_dim)
+      self.ffn = MLP(dim=config.dim, inter_dim=config.inter_dim, activation=activation)
     else:
       if rdep is None:
         raise ValueError("MoE layers require an Rdep instance")
@@ -196,6 +242,8 @@ class Transformer(nn.Module):
     rdep: Rdep | None = None
     #TODO(EM): these if blocks and raises are ugly. rewrite or move
     if has_moe:
+      # SM100-only; keep import lazy so dense/bf16 runs don't require RDEP.
+      from nmoe.rdep import Rdep
       if config.n_routed_experts is None or config.n_activated_experts is None:
         raise ValueError("MoE requires n_routed_experts and n_activated_experts")
       if config.n_routed_experts % max(1, world) != 0:
@@ -220,23 +268,9 @@ class Transformer(nn.Module):
     ])
     self.norm = RMSNorm(config.dim, config.rms_norm_eps)
     self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False, dtype=torch.bfloat16)
-    # μP scaling (validated via proxy sweep - both scales needed for proper gradient flow)
-    self.mup_scale_factor = 10.667
-    self.logits_scale_factor = 0.125
-
-    # MTP (Multi-Token Prediction) - disabled when mtp_depth=0
-    mtp_depth = getattr(config, 'mtp_depth', 0)
-    if mtp_depth > 0:
-      self.mtp = MTP(
-        config,
-        embedding=self.embedding,
-        lm_head=self.lm_head,
-        mup_scale=self.mup_scale_factor,
-        logits_scale=self.logits_scale_factor,
-        attn_cls_fn=lambda: get_attention(config.attn)(config),
-      )
-    else:
-      self.mtp = None
+    # NVFP4-only I/O gains (set/validated in train.py before model construction).
+    self.fp4_embed_gain = float(getattr(config, 'fp4_embed_gain', None) or 1.0)
+    self.fp4_logits_gain = float(getattr(config, 'fp4_logits_gain', None) or 1.0)
 
   def init_weights(self):
     nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
@@ -245,14 +279,15 @@ class Transformer(nn.Module):
     self.norm.weight.data.fill_(1.0)
     final_std = self.config.dim ** -0.5
     nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=final_std)
-    if self.mtp is not None:
-      self.mtp.init_weights()
 
   def param_sets(self):
     expert_params: list[torch.nn.Parameter] = []
     for m in self.modules():
       if isinstance(m, MoE):
-        expert_params.extend([m.W1, m.W3, m.W2])
+        expert_params.append(m.W1)
+        if m.W3 is not None:
+          expert_params.append(m.W3)
+        expert_params.append(m.W2)
     expert_ids = {id(p) for p in expert_params}
     dense_params: list[torch.nn.Parameter] = []
     for p in self.parameters():
@@ -261,9 +296,9 @@ class Transformer(nn.Module):
     return expert_params, dense_params
 
   @record_function("transformer")
-  def forward(self, tokens: torch.Tensor, *, targets: torch.Tensor | None = None) -> torch.Tensor:
+  def forward(self, tokens: torch.Tensor, *, return_hidden: bool = False) -> torch.Tensor:
     with record_function("embedding"):
-      x = self.embedding(tokens) * self.mup_scale_factor
+      x = self.embedding(tokens) * self.fp4_embed_gain
     seqlen = tokens.size(1)
     cos = self.rope.cos[:seqlen]
     sin = self.rope.sin[:seqlen]
@@ -279,18 +314,12 @@ class Transformer(nn.Module):
         for m, l in zip(moe_layers, loads):
           m.last_loads = l
 
-    # MTP: compute loss before final norm (uses h0 = x before self.norm)
-    # Note: MTP.forward mutates self.mtp.last_loss as a side effect
-    if self.mtp is not None:
-      if self.training and targets is not None:
-        self.mtp(x, targets, cos, sin)
-      else:
-        self.mtp.last_loss = None  # Clear stale loss when not computing MTP
-
     with record_function("norm_f"):
       x = self.norm(x)
+    if return_hidden:
+      return x
     # Dynamic amax scaling handles range - no clamp needed (TorchTitan/Megatron pattern)
     with record_function("lm_head"):
-      logits = self.lm_head(x) * self.logits_scale_factor
+      logits = self.lm_head(x) * self.fp4_logits_gain
 
     return logits

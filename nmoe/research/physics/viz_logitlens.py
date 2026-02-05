@@ -7,7 +7,7 @@ publication-friendly SVG heatmaps:
   - Delta vs baseline by layer (negative is better)
 
 Run:
-  python -m nmoe.physics.viz_logitlens --runs /tmp/arch_ablations
+  python -m nmoe.research.physics.viz_logitlens --runs /tmp/arch_ablations
 """
 
 from __future__ import annotations

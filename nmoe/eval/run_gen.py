@@ -4,7 +4,7 @@ from __future__ import annotations
 Generation-based eval runner (GSM8K / HumanEval / GPQA).
 
 Issue [07] intent:
-- No dependency on `nmoe.serve.*` (standalone, model-direct generation).
+- No dependency on inference-engine modules (standalone, model-direct generation).
 - Distributed-safe: all ranks participate and remain in lockstep by construction.
 - Prompt-length semantics preserved (explicit length tracking; no "real-token padding" bugs).
 """
@@ -50,11 +50,11 @@ def _print0(rank: int, *a: Any, **kw: Any) -> None:
 
 def _load_config(path: str):
     import tomllib
-    from nmoe.config import Config
+    from nmoe.config import Config, upgrade_cfg_dict
 
     with open(path, "rb") as f:
         cfg_dict = tomllib.load(f)
-    return Config(**cfg_dict)
+    return Config(**upgrade_cfg_dict(cfg_dict))
 
 
 def _load_snapshot(path: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -73,7 +73,8 @@ def _forward_hidden(model: torch.nn.Module, tokens: torch.Tensor) -> torch.Tenso
     if not hasattr(model, "rope"):
         raise TypeError("model must have rope buffers (RotaryEmbedding)")
 
-    x = model.embedding(tokens) * float(getattr(model, "mup_scale_factor", 1.0))
+    embed_gain = float(getattr(model, "fp4_embed_gain", getattr(model, "mup_scale_factor", 1.0)))
+    x = model.embedding(tokens) * embed_gain
     seqlen = int(tokens.size(1))
     cos = model.rope.cos[:seqlen].to(tokens.device)
     sin = model.rope.sin[:seqlen].to(tokens.device)
@@ -172,7 +173,7 @@ def _generate_lockstep(
     if lm_head is None or not hasattr(lm_head, "weight"):
         raise TypeError("model must expose lm_head.weight")
     W = lm_head.weight.detach()
-    logits_scale = float(getattr(model, "logits_scale_factor", 1.0))
+    logits_scale = float(getattr(model, "fp4_logits_gain", getattr(model, "logits_scale_factor", 1.0)))
     vocab_chunk = 4096
     for _ in range(int(max_new_tokens)):
         hidden = _forward_hidden(model, tokens)  # [1,T,D]
@@ -227,8 +228,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     state = None
     if args.checkpoint:
         cfg_dict, state = _load_snapshot(args.checkpoint)
-        from nmoe.config import Config
-        cfg = Config(**cfg_dict)
+        from nmoe.config import Config, upgrade_cfg_dict
+        cfg = Config(**upgrade_cfg_dict(cfg_dict))
     elif args.config:
         cfg = _load_config(args.config)
     else:

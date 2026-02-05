@@ -1,8 +1,9 @@
 """Optimizer construction, LR scheduling, and training step for MoE.
 
-Two parameter types:
-- expert: MoE expert MLPs (sharded via RDEP, optimized with Muon)
-- dense: everything else - attention, embeddings, norms, router (replicated, ZeRO-2, AdamW)
+Three optimizer types:
+- NorMuon: 2D weight matrices (attention, MLP) - Polar Express orthogonalization
+- AdamW: embeddings, norms, biases, router - standard AdamW
+- ExpertAdamW: MoE expert MLPs (sharded via RDEP, fused with quantization)
 
 Precision support: bf16, fp8, nvfp4 (default: nvfp4)
 """
@@ -12,7 +13,240 @@ import torch.distributed as dist
 
 from nmoe.config import Config
 from nmoe import zero2
-from nmoe.csrc import rdep as _rdep_ext
+from nmoe.ks2d import KS2D
+
+# Lazy import for normuon CUDA kernel
+_muon_ext = None
+def _get_muon_ext():
+  global _muon_ext
+  if _muon_ext is None:
+    from nmoe.csrc.opt import muon as _muon_ext
+  return _muon_ext
+
+
+# Lazy import for SM100-only rdep extension. Dense/bf16 runs should not depend on it.
+_rdep_ext = None
+def _get_rdep_ext():
+  global _rdep_ext
+  if _rdep_ext is None:
+    from nmoe.csrc import rdep as _rdep_ext
+  return _rdep_ext
+
+
+class NorMuon(torch.optim.Optimizer):
+  """NorMuon optimizer for 2D weight matrices.
+
+  Matches modded-nanogpt's NorMuon:
+  - Momentum SGD base
+  - Polar Express orthogonalization (5 iterations)
+  - Low-rank variance reduction (Adafactor-style)
+  - Cautious weight decay
+
+  Only use for 2D weight tensors (attention projections, MLP weights).
+  Do NOT use for embeddings, norms, biases, or 1D params.
+  """
+
+  def __init__(self, params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2):
+    defaults = dict(lr=lr, momentum=momentum, beta2=beta2, weight_decay=weight_decay)
+    super().__init__(params, defaults)
+    self._plan_cache = {}  # Cache muon plans by (M, N) shape
+
+  def _get_plan(self, M: int, N: int, Bmax: int = 32):
+    """Get or create a muon plan for shape (M, N)."""
+    key = (M, N)
+    if key not in self._plan_cache:
+      ext = _get_muon_ext()
+      self._plan_cache[key] = ext.plan_create(Bmax, M, N)
+    return self._plan_cache[key]
+
+  def __del__(self):
+    """Clean up muon plans."""
+    ext = _get_muon_ext()
+    for plan in self._plan_cache.values():
+      try:
+        ext.plan_destroy(plan)
+      except Exception:
+        pass
+
+  @torch.no_grad()
+  def step(self, closure=None):
+    """Perform a single optimization step."""
+    if closure is not None:
+      raise RuntimeError("NorMuon does not support closure")
+
+    ext = _get_muon_ext()
+
+    for group in self.param_groups:
+      lr = group['lr']
+      momentum = group['momentum']
+      beta2 = group['beta2']
+      wd = group['weight_decay']
+
+      for p in group['params']:
+        if p.grad is None:
+          continue
+
+        grad = p.grad
+        if grad.dim() != 2:
+          raise RuntimeError(f"NorMuon only supports 2D tensors, got {grad.dim()}D")
+
+        state = self.state[p]
+
+        # Initialize state
+        if len(state) == 0:
+          state['momentum_buffer'] = torch.zeros_like(grad)
+          # Variance buffer along smaller dimension (like Adafactor)
+          if grad.size(0) >= grad.size(1):
+            state['variance_buffer'] = torch.zeros(grad.size(0), 1, device=grad.device, dtype=torch.float32)
+          else:
+            state['variance_buffer'] = torch.zeros(1, grad.size(1), device=grad.device, dtype=torch.float32)
+
+        mom_buf = state['momentum_buffer']
+        var_buf = state['variance_buffer']
+
+        # 1. Momentum update
+        mom_buf.lerp_(grad, 1 - momentum)
+        update = grad.lerp(mom_buf, momentum)
+
+        # 2. Polar Express orthogonalization
+        # Reshape to (1, M, N) for batched API
+        M, N = update.shape
+        update_3d = update.unsqueeze(0).contiguous()
+
+        # Need BF16 for normuon kernel
+        if update_3d.dtype != torch.bfloat16:
+          update_3d = update_3d.bfloat16()
+
+        plan = self._get_plan(M, N)
+        ext.plan_run(plan, update_3d.data_ptr(), 1, M, N)
+
+        update = update_3d.squeeze(0)
+        if p.dtype != update.dtype:
+          update = update.to(p.dtype)
+
+        # 3. Variance reduction (Adafactor-style), matching modded-nanogpt.
+        # This stabilizes Muon scaling (e.g., batch-scaled LR) by normalizing the update.
+        red_dim = -1 if grad.size(0) >= grad.size(1) else -2
+        v_mean = update.float().square().mean(dim=red_dim, keepdim=True)
+        red_dim_size = update.size(red_dim)
+        v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
+        v_norm = v_norm_sq.sqrt_()
+        var_buf.lerp_(v_mean.to(dtype=var_buf.dtype), 1 - beta2)
+        step_size = var_buf.clamp_min(1e-10).rsqrt_()
+        scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+        v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
+        final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
+        update.mul_(final_scale.type_as(update))
+
+        # 4. Cautious weight decay (Muon): only decay where update and param agree in sign.
+        # modded-nanogpt scales this term like wd * lr^2 (wd tensor already includes lr).
+        if wd > 0:
+          mask = (update * p) >= 0
+          p.sub_(p * mask, alpha=float(wd) * float(lr) * float(lr))
+
+        # 5. Apply update
+        p.sub_(update, alpha=float(lr))
+
+
+class ExpertMuon(torch.optim.Optimizer):
+  """Muon-style optimizer for MoE expert weights ([E, M, N] tensors).
+
+  This matches the NorMuon recipe but applies polar retraction per expert matrix
+  in a single batched kernel call.
+  """
+
+  emits_weight_cache = False
+
+  def __init__(self, params, lr=3.4e-4, momentum=0.95, beta2=0.95, weight_decay=1.2):
+    defaults = dict(lr=lr, momentum=momentum, beta2=beta2, weight_decay=weight_decay)
+    super().__init__(params, defaults)
+    self._plan_cache = {}  # Cache muon plans by (Bmax, M, N) shape
+
+  def _get_plan(self, B: int, M: int, N: int):
+    key = (B, M, N)
+    if key not in self._plan_cache:
+      ext = _get_muon_ext()
+      self._plan_cache[key] = ext.plan_create(B, M, N)
+    return self._plan_cache[key]
+
+  def __del__(self):
+    ext = _get_muon_ext()
+    for plan in self._plan_cache.values():
+      try:
+        ext.plan_destroy(plan)
+      except Exception:
+        pass
+
+  @torch.no_grad()
+  def step(self, closure=None):
+    if closure is not None:
+      raise RuntimeError("ExpertMuon does not support closure")
+
+    ext = _get_muon_ext()
+
+    for group in self.param_groups:
+      lr = float(group['lr'])
+      momentum = float(group['momentum'])
+      beta2 = float(group['beta2'])
+      wd = float(group['weight_decay'])
+
+      for p in group['params']:
+        if p.grad is None:
+          raise RuntimeError("ExpertMuon requires all expert grads to be present")
+
+        grad = p.grad
+        if grad.dim() != 3:
+          raise RuntimeError(f"ExpertMuon only supports 3D tensors, got {grad.dim()}D")
+        if not (p.is_cuda and grad.is_cuda):
+          raise RuntimeError("ExpertMuon requires CUDA tensors")
+        if p.dtype != torch.bfloat16 or grad.dtype != torch.bfloat16:
+          raise RuntimeError("ExpertMuon requires BF16 expert weights and grads")
+        if not (p.is_contiguous() and grad.is_contiguous()):
+          raise RuntimeError("ExpertMuon requires contiguous expert weights and grads")
+
+        state = self.state[p]
+
+        E, M, N = grad.shape
+
+        if len(state) == 0:
+          state['momentum_buffer'] = torch.zeros_like(grad)
+          # Variance buffer along smaller dimension (Adafactor-style), per expert.
+          if M >= N:
+            state['variance_buffer'] = torch.zeros(E, M, 1, device=grad.device, dtype=torch.float32)
+          else:
+            state['variance_buffer'] = torch.zeros(E, 1, N, device=grad.device, dtype=torch.float32)
+
+        mom_buf = state['momentum_buffer']
+        var_buf = state['variance_buffer']
+
+        # 1) Momentum update
+        mom_buf.lerp_(grad, 1 - momentum)
+        update = grad.lerp(mom_buf, momentum).contiguous()
+
+        # 2) Polar Express orthogonalization (batched over experts)
+        plan = self._get_plan(int(E), int(M), int(N))
+        ext.plan_run(plan, update.data_ptr(), int(E), int(M), int(N))
+
+        # 3) Variance reduction (Adafactor-style), matching NorMuon.
+        red_dim = -1 if M >= N else -2
+        v_mean = update.float().square().mean(dim=red_dim, keepdim=True)
+        red_dim_size = int(update.size(red_dim))
+        v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
+        v_norm = v_norm_sq.sqrt_()
+        var_buf.lerp_(v_mean.to(dtype=var_buf.dtype), 1 - beta2)
+        step_size = var_buf.clamp_min(1e-10).rsqrt_()
+        scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+        v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
+        final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
+        update.mul_(final_scale.type_as(update))
+
+        # 4) Cautious weight decay (Muon).
+        if wd > 0:
+          mask = (update * p) >= 0
+          p.sub_(p * mask, alpha=float(wd) * float(lr) * float(lr))
+
+        # 5) Apply update
+        p.sub_(update, alpha=float(lr))
 
 
 class ExpertAdamW(torch.optim.Optimizer):
@@ -40,6 +274,7 @@ class ExpertAdamW(torch.optim.Optimizer):
     }
     super().__init__(params, defaults)
     self._moes = moe_modules
+    self._base_seed_u32 = int(getattr(cfg, "seed", 0)) & 0xFFFFFFFF
 
   def _init_state(self, p: torch.Tensor) -> dict:
     state = self.state[p]
@@ -82,6 +317,9 @@ class ExpertAdamW(torch.optim.Optimizer):
         step_t = st["step"]
     assert step_t is not None
     step = int(step_t.item())
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    seed_u32 = (self._base_seed_u32 ^ ((rank * 0x9e3779b9) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    step_u32 = step & 0xFFFFFFFF
 
     # Bias corrections match the standard AdamW update.
     bias_correction1 = 1.0 - (beta1**step)
@@ -126,7 +364,7 @@ class ExpertAdamW(torch.optim.Optimizer):
 
       E, H, Dff = W1.shape
       stream = torch.cuda.current_stream(W1.device)
-      _rdep_ext.expert_adamw_step(
+      _get_rdep_ext().expert_adamw_step(
         prof_i,
         W1.data_ptr(), W1.grad.data_ptr(), st1["exp_avg"].data_ptr(), st1["exp_avg_sq"].data_ptr(),
         W3.data_ptr(), W3.grad.data_ptr(), st3["exp_avg"].data_ptr(), st3["exp_avg_sq"].data_ptr(),
@@ -137,27 +375,42 @@ class ExpertAdamW(torch.optim.Optimizer):
         float(lr), float(beta1), float(beta2),
         float(weight_decay), float(eps),
         float(step_size), float(inv_bias_correction2_sqrt),
+        seed_u32, step_u32,
         stream,
       )
 
     return None
 
 
-def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Optimizer, list[dict]]:
-  """Build optimizer for experts and return dense groups for AdamW/ZeRO-2.
+def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Optimizer | None, torch.optim.Optimizer | None, list[dict]]:
+  """Build optimizers: NorMuon for 2D weights, AdamW for rest, ExpertAdamW for MoE.
+
+  Hybrid optimizer strategy (matches modded-nanogpt):
+  - NorMuon: 2D weight matrices (attention, MLP) - lr=0.023, wd=1.2
+  - AdamW: embeddings, norms, biases, router - lr=0.008, wd=0.005
+  - ExpertAdamW: MoE expert weights (with quantization cache)
 
   Returns:
-    (expert_optimizer, dense_groups): Expert optimizer and dense param groups for ZeRO-2
+    (expert_optimizer, muon_optimizer, dense_groups):
+      expert_optimizer: For MoE experts (None if dense-only)
+      muon_optimizer: For 2D weight matrices (None if use_muon=False)
+      dense_groups: For ZeRO-2 AdamW (embeds, norms, biases, router)
   """
-  # Collect parameters by type (single source of truth when available)
-  expert_params: list[torch.nn.Parameter] = []
-  router_params: list[torch.nn.Parameter] = []  # Router gate weights (separate LR, no decay)
+  use_muon = getattr(cfg, "use_muon", False)
+  muon_lr = getattr(cfg, "lr_muon", 0.023)
+  muon_momentum = getattr(cfg, "muon_momentum", 0.95)
+  muon_wd = getattr(cfg, "muon_weight_decay", 1.2)
+
+  # Collect parameters by type
+  expert_named_params: list[tuple[str, torch.nn.Parameter]] = []
+  router_params: list[torch.nn.Parameter] = []
+  muon_params: list[torch.nn.Parameter] = []  # 2D weights for NorMuon
   dense_params_decay: list[torch.nn.Parameter] = []
   dense_params_no_decay: list[torch.nn.Parameter] = []
 
   expert_ids: set[int] = set()
   if hasattr(model, "param_sets"):
-    eps, _ = model.param_sets()  # type: ignore[attr-defined]
+    eps, _ = model.param_sets()
     expert_ids = {id(p) for p in eps}
 
   for name, param in model.named_parameters():
@@ -165,31 +418,32 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
       continue
 
     if id(param) in expert_ids:
-      expert_params.append(param)
+      expert_named_params.append((name, param))
       continue
 
-    # Router parameters: separate group with lr_router and weight_decay=0
-    # Matches old_nmoe behavior for aux-free load balancing stability
+    # Router: separate group, no decay
     if 'router' in name:
       router_params.append(param)
       continue
 
-    # Dense params: split decay vs no-decay by name pattern
-    is_adapter = name.endswith('.A') or name.endswith('.B') or name.endswith('.g')
-    no_decay = (
-      is_adapter
-      or name.endswith('.bias')
-      or 'norm' in name
-      or name.startswith('embedding.')
-      or name.startswith('lm_head.')
-      or 'bungee' in name
+    # Check if this is a 2D weight eligible for NorMuon
+    is_2d_weight = param.dim() == 2 and param.numel() > 1024
+    is_adam_only = (
+      name.endswith('.bias') or
+      'norm' in name or
+      'embedding' in name or
+      'lm_head' in name or
+      'bungee' in name
     )
-    if no_decay:
+
+    if use_muon and is_2d_weight and not is_adam_only:
+      muon_params.append(param)
+    elif is_adam_only or param.dim() < 2:
       dense_params_no_decay.append(param)
     else:
       dense_params_decay.append(param)
 
-  # Build dense param groups (for ZeRO-2 AdamW)
+  # Build dense param groups (ZeRO-2 AdamW)
   dense_groups = []
   if dense_params_decay:
     dense_groups.append({
@@ -205,7 +459,6 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
       'lr': cfg.lr_dense,
       'weight_decay': 0.0,
     })
-  # Router group: separate LR, no weight decay (critical for aux-free load balancing)
   if router_params:
     dense_groups.append({
       'name': 'router',
@@ -214,28 +467,87 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
       'weight_decay': 0.0,
     })
 
-  # Expert optimizer: AdamW (benchmark proxy for Muon ceiling).
-  use_blockscaled = getattr(cfg, "dtype", "nvfp4") in ("fp8", "nvfp4")
-  if use_blockscaled and expert_params:
-    moes: list[torch.nn.Module] = []
-    for blk in getattr(model, "blocks", []):
-      ffn = getattr(blk, "ffn", None)
-      if ffn is not None and hasattr(ffn, "W1") and hasattr(ffn, "W3") and hasattr(ffn, "W2"):
-        moes.append(ffn)
-    expert_optimizer = ExpertAdamW(moes, cfg)
-  else:
-    expert_optimizer = torch.optim.AdamW(
-      expert_params,
-      lr=cfg.lr_expert,
-      betas=(cfg.adam_beta1, cfg.adam_beta2_expert),  # Higher beta2 for expert gradient noise
-      eps=cfg.adam_eps,
-      weight_decay=cfg.weight_decay,
+  # NorMuon optimizer for 2D weights
+  muon_optimizer: torch.optim.Optimizer | None = None
+  if use_muon and muon_params:
+    muon_optimizer = NorMuon(
+      muon_params,
+      lr=muon_lr,
+      momentum=muon_momentum,
+      beta2=0.95,
+      weight_decay=muon_wd,
     )
 
-  return expert_optimizer, dense_groups
+  # Expert optimizer (MoE only)
+  expert_params = [p for _, p in expert_named_params]
+  expert_optimizer: torch.optim.Optimizer | None = None
+  if expert_params:
+    expert_opt = getattr(cfg, "expert_opt", None)
+    expert_opt = str(expert_opt or "").strip().lower()
+    use_blockscaled = getattr(cfg, "dtype", "nvfp4") in ("fp8", "nvfp4")
+    if expert_opt in ("", "auto"):
+      if use_blockscaled:
+        moes: list[torch.nn.Module] = []
+        for blk in getattr(model, "blocks", []):
+          ffn = getattr(blk, "ffn", None)
+          if ffn is not None and hasattr(ffn, "W1") and hasattr(ffn, "W3") and hasattr(ffn, "W2"):
+            moes.append(ffn)
+        expert_optimizer = ExpertAdamW(moes, cfg)
+      else:
+        expert_optimizer = torch.optim.AdamW(
+          expert_params,
+          lr=cfg.lr_expert,
+          betas=(cfg.adam_beta1, cfg.adam_beta2_expert),
+          eps=cfg.adam_eps,
+          weight_decay=cfg.weight_decay,
+        )
+    elif expert_opt == "adamw":
+      expert_optimizer = torch.optim.AdamW(
+        expert_params,
+        lr=cfg.lr_expert,
+        betas=(cfg.adam_beta1, cfg.adam_beta2_expert),
+        eps=cfg.adam_eps,
+        weight_decay=cfg.weight_decay,
+      )
+    elif expert_opt == "muon":
+      expert_optimizer = ExpertMuon(
+        expert_params,
+        lr=float(cfg.lr_expert),
+        momentum=float(getattr(cfg, "muon_momentum", 0.95)),
+        beta2=float(getattr(cfg, "adam_beta2_expert", 0.95)),
+        weight_decay=float(getattr(cfg, "muon_weight_decay", 1.2)),
+      )
+    elif expert_opt == "ks2d":
+      warmup = getattr(cfg, "ks2d_warmup_steps", None)
+      warmup_steps = int(cfg.warmup_steps) if warmup is None else int(warmup)
+      rank = int(getattr(cfg, "ks2d_rank", 8))
+      cb_freq = int(getattr(cfg, "ks2d_codebook_update_freq", 100))
+      max_rms = float(getattr(cfg, "ks2d_max_update_rms", 1.0))
+
+      groups: dict[str, list[torch.nn.Parameter]] = {}
+      for name, p in expert_named_params:
+        leaf = name.rsplit(".", 1)[-1]
+        role = f"expert_{leaf.lower()}" if leaf in ("W1", "W2", "W3") else "expert"
+        groups.setdefault(role, []).append(p)
+      param_groups = [{"ks2d_role": r, "params": ps} for r, ps in sorted(groups.items())]
+      expert_optimizer = KS2D(
+        param_groups,
+        lr=float(cfg.lr_expert),
+        momentum=float(cfg.adam_beta1),
+        beta2=float(cfg.adam_beta2_expert),
+        weight_decay=float(cfg.weight_decay),
+        rank=rank,
+        codebook_update_freq=cb_freq,
+        warmup_steps=warmup_steps,
+        max_update_rms=max_rms,
+      )
+    else:
+      raise ValueError(f"Unknown expert_opt={expert_opt!r} (expected: auto|adamw|muon|ks2d)")
+
+  return expert_optimizer, muon_optimizer, dense_groups
 
 
-def update_lr(optimizer: torch.optim.Optimizer, dense_groups: list[dict], step: int, tokens_seen: int, cfg: Config) -> float:
+def update_lr(optimizer: torch.optim.Optimizer | None, muon_optimizer: torch.optim.Optimizer | None, dense_groups: list[dict], step: int, tokens_seen: int, cfg: Config) -> float:
   """Update learning rate using a DeepSeek-style WSD schedule.
 
   WSD (Warmup-Sustain-Decay):
@@ -282,8 +594,18 @@ def update_lr(optimizer: torch.optim.Optimizer, dense_groups: list[dict], step: 
   lr_dense = floor_dense + (peak_dense - floor_dense) * lr_scale
   lr_router = floor_router + (peak_router - floor_router) * lr_scale
 
-  for g in optimizer.param_groups:
-    g['lr'] = lr_expert
+  if optimizer is not None:
+    for g in optimizer.param_groups:
+      g['lr'] = lr_expert
+
+  # NorMuon uses its own LR schedule (same shape, different peak)
+  if muon_optimizer is not None:
+    peak_muon = float(getattr(cfg, "lr_muon", 0.023))
+    floor_muon = min(floor, peak_muon)
+    lr_muon = floor_muon + (peak_muon - floor_muon) * lr_scale
+    for g in muon_optimizer.param_groups:
+      g['lr'] = lr_muon
+
   for g in dense_groups:
     # Router group uses lr_router, others use lr_dense
     if g.get('name') == 'router':
@@ -295,15 +617,16 @@ def update_lr(optimizer: torch.optim.Optimizer, dense_groups: list[dict], step: 
   return float(lr_dense)
 
 
-def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups: list[dict], zero2_state: dict, cfg: Config, world: int) -> None:
-  """Optimizer step with ZeRO-2 and post-step hooks.
+def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None, muon_optimizer: torch.optim.Optimizer | None, dense_groups: list[dict], zero2_state: dict, cfg: Config, world: int) -> None:
+  """Optimizer step with ZeRO-2, NorMuon, and post-step hooks.
 
   Handles:
   - ZeRO-2 AdamW stepping for dense params (if world > 1)
-  - Muon stepping for expert params
+  - NorMuon stepping for 2D weights (attention, MLP)
+  - ExpertAdamW stepping for MoE expert params
   - Post-step model updates (quantization rebuild, router bias)
   """
-  # ZeRO-2 AdamW step for dense params
+  # ZeRO-2 AdamW step for dense params (embeds, norms, biases, router)
   if world > 1:
     zero2.step_dense_adamw(
       dense_groups,
@@ -315,26 +638,52 @@ def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups:
   else:
     zero2.step_dense_adamw(dense_groups, state=zero2_state)
 
-  # Muon step for expert params (no ZeRO-2, params already sharded via RDEP)
-  optimizer.step()
+  # NorMuon step for 2D weight matrices
+  if muon_optimizer is not None:
+    muon_optimizer.step()
+
+  # Expert optimizer step (no ZeRO-2, params already sharded via RDEP)
+  if optimizer is not None:
+    optimizer.step()
+
+  # Bias updates should decay with router LR so they don't dominate during warmdown.
+  router_bias_gamma = float(getattr(cfg, "router_bias_update_rate", 0.0))
+  if router_bias_gamma != 0.0:
+    peak_router = float(getattr(cfg, "lr_router", 0.0))
+    floor_router = min(float(getattr(cfg, "decay_floor", 0.0)), peak_router)
+    lr_router = peak_router
+    for g in dense_groups:
+      if g.get("name") == "router":
+        lr_router = float(g.get("lr", peak_router))
+        break
+    denom = peak_router - floor_router
+    if denom > 0.0:
+      lr_scale = (lr_router - floor_router) / denom
+      if lr_scale < 0.0:
+        lr_scale = 0.0
+      elif lr_scale > 1.0:
+        lr_scale = 1.0
+      router_bias_gamma *= lr_scale
 
   # Post-step hooks (quantization rebuild, router bias update)
   with torch.no_grad():
-    for blk in model.blocks:
+    for i, blk in enumerate(model.blocks):
       ffn = getattr(blk, 'ffn', None)
       if ffn is None:
         continue
 
       # Refresh quantized weight cache (FP8/NVFP4)
-      if (not getattr(optimizer, "emits_weight_cache", False)) and hasattr(ffn, 'refresh_weight_cache'):
-        try:
-          ffn.refresh_weight_cache()
-        except Exception:
-          pass
+      if hasattr(ffn, 'refresh_weight_cache'):
+        emits_cache = bool(getattr(optimizer, "emits_weight_cache", False)) if optimizer is not None else False
+        if not emits_cache:
+          try:
+            ffn.refresh_weight_cache()
+          except Exception as e:
+            raise RuntimeError(f"post-step weight cache refresh failed (block={i}, ffn={type(ffn).__name__})") from e
 
       # Update router bias for aux-free load balancing
-      if hasattr(ffn, 'router') and hasattr(ffn, 'last_loads'):
+      if router_bias_gamma != 0.0 and hasattr(ffn, 'router') and getattr(ffn, 'last_loads', None) is not None:
         try:
-          ffn.router.update_bias(ffn.last_loads, gamma=cfg.router_bias_update_rate)
-        except Exception:
-          pass
+          ffn.router.update_bias(ffn.last_loads, gamma=router_bias_gamma)
+        except Exception as e:
+          raise RuntimeError(f"post-step router bias update failed (block={i}, ffn={type(ffn).__name__})") from e

@@ -67,26 +67,6 @@ type IndexHeaderStats = {
 }
 type IndexDocView = { idx_path: string; shard_path: string; doc_idx: number; start: number; end: number; length: number; tokens: number[] }
 
-type FlowInspect = {
-  path: string
-  is_flow_dir: boolean
-  stages: { raw: boolean; hydra: boolean; kept: boolean; rephrase: boolean; prep: boolean }
-  flow_spec: any | null
-  hydra_summary: null | {
-    total: number
-    kept: number
-    band: number
-    dropped: number
-    tau_drop: number | null
-    tau_keep: number | null
-    top_sources: Array<{ source: string; kept: number; band: number; dropped: number }>
-  }
-  training_shards: null | {
-    path: string
-    manifest: ManifestPreview
-  }
-}
-
 function fmtBytes(n: number): string {
   if (!Number.isFinite(n)) return "—"
   if (n < 1024) return `${n} B`
@@ -115,7 +95,6 @@ export function DatasetsInspector() {
   const [tokenWindow, setTokenWindow] = React.useState<TokenWindow | null>(null)
   const [idx, setIdx] = React.useState<IndexHeaderStats | null>(null)
   const [doc, setDoc] = React.useState<IndexDocView | null>(null)
-  const [flow, setFlow] = React.useState<FlowInspect | null>(null)
 
   const [offset, setOffset] = React.useState("0")
   const [length, setLength] = React.useState("256")
@@ -144,7 +123,6 @@ export function DatasetsInspector() {
     setTokenWindow(null)
     setIdx(null)
     setDoc(null)
-    setFlow(null)
 
     try {
       const metaUrl = new URL("/api/datasets/meta", window.location.origin)
@@ -158,15 +136,6 @@ export function DatasetsInspector() {
       const lower = path.toLowerCase()
 
       if (kind === "dir") {
-        // Flow-first: dataprep shard workspace.
-        {
-          const flowUrl = new URL("/api/datasets/pipeline", window.location.origin)
-          if (path) flowUrl.searchParams.set("path", path)
-          const fr = await fetch(flowUrl.toString(), { cache: "no-store" })
-          const fj = await fr.json()
-          if (fr.ok) setFlow(fj as FlowInspect)
-        }
-
         // Canonical dataset view: dir with manifest.json.
         {
           const manUrl = new URL("/api/datasets/manifest", window.location.origin)
@@ -288,8 +257,6 @@ export function DatasetsInspector() {
     router.push(url.pathname + url.search)
   }
 
-  const showPipeline = Boolean(flow?.is_flow_dir)
-
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -327,7 +294,6 @@ export function DatasetsInspector() {
       <Tabs defaultValue="overview">
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
-          {showPipeline ? <TabsTrigger value="pipeline">Pipeline</TabsTrigger> : null}
           {stats ? <TabsTrigger value="shard">Shard</TabsTrigger> : null}
           {idx ? <TabsTrigger value="index">Index</TabsTrigger> : null}
           {manifest?.found ? <TabsTrigger value="manifest">Manifest</TabsTrigger> : null}
@@ -341,7 +307,6 @@ export function DatasetsInspector() {
                 <span className="flex items-center gap-2">
                   {meta ? <Badge variant="outline">{meta.kind}</Badge> : null}
                   {stats?.kind ? <Badge variant="secondary">{stats.kind}</Badge> : null}
-                  {showPipeline ? <Badge variant="secondary">flow</Badge> : null}
                 </span>
               </CardTitle>
             </CardHeader>
@@ -391,124 +356,6 @@ export function DatasetsInspector() {
             </Card>
           ) : null}
         </TabsContent>
-
-        {showPipeline ? (
-          <TabsContent value="pipeline" className="space-y-4">
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">Stages</CardTitle>
-              </CardHeader>
-              <CardContent className="flex flex-wrap gap-2">
-                <StageBadge name="raw" ok={Boolean(flow?.stages.raw)} />
-                <StageBadge name="hydra" ok={Boolean(flow?.stages.hydra)} />
-                <StageBadge name="kept" ok={Boolean(flow?.stages.kept)} />
-                <StageBadge name="rephrase" ok={Boolean(flow?.stages.rephrase)} />
-                <StageBadge name="prep" ok={Boolean(flow?.stages.prep)} />
-              </CardContent>
-            </Card>
-
-            {flow?.hydra_summary ? (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">HYDRA summary</CardTitle>
-                </CardHeader>
-                <CardContent className="grid grid-cols-2 gap-4 md:grid-cols-4">
-                  <div>
-                    <div className="text-xs text-muted-foreground">Total</div>
-                    <div className="font-mono text-sm">{flow.hydra_summary.total.toLocaleString()}</div>
-                  </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground">Kept</div>
-                    <div className="font-mono text-sm">{flow.hydra_summary.kept.toLocaleString()}</div>
-                  </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground">Band</div>
-                    <div className="font-mono text-sm">{flow.hydra_summary.band.toLocaleString()}</div>
-                  </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground">τ_keep</div>
-                    <div className="font-mono text-sm">{flow.hydra_summary.tau_keep == null ? "—" : flow.hydra_summary.tau_keep.toFixed(4)}</div>
-                  </div>
-                </CardContent>
-                {flow.hydra_summary.top_sources.length ? (
-                  <CardContent>
-                    <div className="text-xs text-muted-foreground mb-2">Top sources (by kept)</div>
-                    <Table>
-                      <TableHeader>
-                        <TableRow>
-                          <TableHead>Source</TableHead>
-                          <TableHead>Kept</TableHead>
-                          <TableHead>Band</TableHead>
-                          <TableHead>Dropped</TableHead>
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {flow.hydra_summary.top_sources.map((s) => (
-                          <TableRow key={s.source}>
-                            <TableCell className="font-mono text-xs">{s.source}</TableCell>
-                            <TableCell className="font-mono text-xs">{s.kept.toLocaleString()}</TableCell>
-                            <TableCell className="font-mono text-xs">{s.band.toLocaleString()}</TableCell>
-                            <TableCell className="font-mono text-xs">{s.dropped.toLocaleString()}</TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </CardContent>
-                ) : null}
-              </Card>
-            ) : (
-              <div className="text-xs text-muted-foreground">No `hydra_grades/summary.json` found.</div>
-            )}
-
-            {flow?.training_shards?.manifest?.found ? (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm flex items-center justify-between">
-                    <span>Training shards</span>
-                    <Button variant="outline" size="sm" asChild>
-                      <a href={`/datasets/inspect?path=${encodeURIComponent(flow.training_shards.path)}`}>Inspect</a>
-                    </Button>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="grid grid-cols-2 gap-4 md:grid-cols-4">
-                  <div>
-                    <div className="text-xs text-muted-foreground">Dataset</div>
-                    <div className="font-mono text-sm">{flow.training_shards.manifest.dataset ?? "—"}</div>
-                  </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground">Tokens</div>
-                    <div className="font-mono text-sm">{flow.training_shards.manifest.total_tokens?.toLocaleString() ?? "—"}</div>
-                  </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground">Docs</div>
-                    <div className="font-mono text-sm">{flow.training_shards.manifest.total_documents?.toLocaleString() ?? "—"}</div>
-                  </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground">Shards</div>
-                    <div className="font-mono text-sm">{flow.training_shards.manifest.num_shards?.toLocaleString() ?? "—"}</div>
-                  </div>
-                </CardContent>
-              </Card>
-            ) : (
-              <div className="text-xs text-muted-foreground">No `training_shards/manifest.json` found.</div>
-            )}
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">flow_spec.json</CardTitle>
-              </CardHeader>
-              <CardContent>
-                {flow?.flow_spec ? (
-                  <pre className="text-xs p-3 rounded bg-muted overflow-auto max-h-[70vh]">
-                    {JSON.stringify(flow.flow_spec, null, 2)}
-                  </pre>
-                ) : (
-                  <div className="text-xs text-muted-foreground">Unable to read flow_spec.json.</div>
-                )}
-              </CardContent>
-            </Card>
-          </TabsContent>
-        ) : null}
 
         {stats ? (
           <TabsContent value="shard" className="space-y-4">
@@ -722,12 +569,3 @@ export function DatasetsInspector() {
     </div>
   )
 }
-
-function StageBadge({ name, ok }: { name: string; ok: boolean }) {
-  return (
-    <Badge variant={ok ? "default" : "outline"} className={ok ? "" : "text-muted-foreground"}>
-      {name}
-    </Badge>
-  )
-}
-

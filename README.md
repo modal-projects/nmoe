@@ -7,31 +7,57 @@
   |_| |_||_| |_| |_|\___/ \___|
 ```
 
-> No all-to-all. No tensor parallel. B200-only.
+> No all-to-all. No tensor parallel. B200-first.
 
-This repo is an opinionated Mixture-of-Experts trainer hard-targeted to NVIDIA Blackwell B200 (`sm_100a`).
-MoE expert parallelism is implemented via **RDEP**: direct dispatch/return using CUDA IPC (intra-node) and NVSHMEM (inter-node),
+This repo is an opinionated Mixture-of-Experts trainer for NVIDIA Blackwell B200 (`sm_100a`).
+MoE expert parallelism is implemented via **RDEP**: direct dispatch/return using CUDA IPC (single-node),
 instead of NCCL all-to-all collectives on the expert path.
 
 ## Quick start
 
-This repository is **container-first**. The supported way to build and run is via the Dockerfiles in `docker/`.
+This repository is **container-first** (via `docker/`), with an explicit opt-in host bootstrap for cloud GPU instances.
+
+### Speedrun (happy path)
+
+On an 8×GPU machine (B200 or H100):
+
+```bash
+bash scripts/bootstrap.sh
+n speedrun
+```
+
+What `n speedrun` does:
+- Defaults to `super` (MoE-256).
+- Prepares the canonical speedrun dataset under `${DATA_DIR:-/data}/speedrun/{train,val}` (if missing).
+- Prepares the Karpathy CORE eval bundle under `${DATA_DIR:-/data}/eval/eval_bundle` (if missing).
+- Trains until `target_loss=3.28`, then runs the full CORE suite (22 tasks).
+- Appends an entry (including CORE) to `LEADERBOARD.json` (the official, tracked scoreboard).
+
+Dtype defaults:
+- **B200 / sm_100a**: `fp8` (default)
+- **H100 / sm_90**: `bf16` (bring-up path; blockscaled + MLA are not supported)
+
+View the leaderboard:
+
+```bash
+n speedrun --leaderboard
+cat LEADERBOARD.json
+```
+
+### Docker quick start
 
 Boot a machine with B200 GPUs and run a minimal single-GPU smoke test (`moonlet`) inside the training image:
 
 ```bash
-# Build base image (Dockerfile.train expects this tag)
-docker build -f docker/Dockerfile.base -t xjdr/nmoe:base .
-
-# Build training image
-docker build -f docker/Dockerfile.train -t xjdr/nmoe_train:latest .
+# Build the training image (builds base → system → deps → train)
+make -C docker train
 
 # Run single-GPU training (mount /data for datasets, checkpoints, metrics)
 docker run --gpus all -v /data:/data xjdr/nmoe_train:latest \
   python -m nmoe.train configs/moonlet.toml
 ```
 
-## Multi-GPU and multi-node
+## Multi-GPU (single-node)
 
 Single-node (8×GPU) training:
 
@@ -39,36 +65,28 @@ Single-node (8×GPU) training:
 torchrun --standalone --nproc_per_node=8 -m nmoe.train configs/moonlight.toml
 ```
 
-Multi-node runs require NVSHMEM. Build the NVSHMEM-enabled image:
-
-```bash
-docker build -f docker/Dockerfile.dist -t xjdr/nmoe_dist:latest .
-```
-
-Kubernetes manifests in `k8s/` are templates for training, NVIZ, and profiling; edit hostnames, images, and storage before deploying.
+Kubernetes manifests in `k8s/` are templates for single-node training, NVIZ, and profiling; edit hostnames, images, and storage before deploying.
 
 ## Configs
 
 | Config | Model | Experts | GPUs | Use Case |
 |--------|-------|---------|------|----------|
-| `moonlet.toml` | 7B | 64 (6 active) | 1 | Single-GPU research |
-| `moonlight.toml` | 16B | 64 (6 active) | 8 | Single-node RDEP |
-| `dsv2.toml` | DeepSeek-V2 | 160 (6 active) | 8+ | Multi-node |
-| `dsv3.toml` | DeepSeek-V3 | 256 (8 active) | 32+ | Production |
+| `configs/speedrun/` | Speedrun suite | dense/MoE | 8 | Speedruns + leaderboard |
+| `moonlet.toml` | Moonlet | 64 (6 active) | 1 | Single-GPU research |
+| `moonlight.toml` | Moonlight | 64 (6 active) | 8 | Single-node RDEP |
 
 ## Why RDEP
 
 Traditional MoE uses NCCL all-to-all: every GPU waits for every other GPU.
-RDEP replaces this with direct NVSHMEM puts—each GPU writes tokens directly
-into the expert owner's buffer. No collective. No barrier. No waiting.
+RDEP replaces this with direct dispatch/return: each GPU sends tokens directly
+to the expert owner and receives outputs back. No all-to-all on the MoE path.
 
 ```
 Source rank                       Owner rank
 ───────────                       ──────────
-tokens ──▶ dispatch ─────────────▶ symmetric buffer
+tokens ──▶ dispatch ─────────────▶ owner buffer
               │                         │
-              │   nvshmem_putmem        │
-              │   + atomic slot         ▼
+              │   direct write          ▼
               │                    expert GEMM
               │                         │
 output ◀── scatter ◀───────────── return
@@ -89,10 +107,10 @@ python -m nmoe.data.cli prep \
 ```
 
 Two workflows:
-- **Direct shards** (research): set `data_path` in config
-- **Flows** (production): set `flow_mode`, `mixture_toml`, `flow_profiles_toml`
+- **Direct shards** (fast): set `data_path` in config
+- **Mixtures**: set `flow_mode`, `mixture_toml`, `flow_profiles_toml` and prep sources via `prep-mixture`
 
-See `nmoe/data/README.md` for the full data pipeline.
+See `nmoe/data/README.md` for the data contract and golden-path commands.
 
 ## Metrics & NVIZ
 
@@ -114,7 +132,7 @@ nmoe/
 ├── config.py         # TOML config
 ├── metrics.py        # DuckDB writer
 ├── csrc/             # CUDA kernels
-├── data/             # Data pipeline, HYDRA
+├── data/             # Data pipeline (HF → shards) + loader
 ├── attention/        # MLA, DSA, SWA, NSA, KDA
 └── eval/             # Evaluation hooks
 ```
@@ -134,15 +152,12 @@ With `attn_global_every = 6`, layers 0-4 use SWA, layer 5 uses MLA, layers 6-10 
 
 ## What's Inside
 
-**RDEP Kernels** — Fused dispatch/return using NVSHMEM (inter-node) and IPC (intra-node).
-BF16 and blockscaled (FP8/NVFP4) paths.
+**RDEP Kernels** — Fused dispatch/return using CUDA IPC (single-node).
+BF16 and blockscaled (FP8/NVFP4) paths (B200-first).
 
 **Grouped GEMMs** — cuBLASLt with per-expert scaling. SM100-optimized via CuTe DSL.
 
 **Deterministic Resume** — Checkpoint includes RNG state, shard cursor, config fingerprint.
-
-**HYDRA** — LLM-as-judge data quality pipeline. See `nmoe/data/HYDRA.md`.
-This repo includes `nmoe/data/hydra_judge.pt` (a small judge head `state_dict`); see `nmoe/data/HYDRA_JUDGE_HEAD.md`.
 
 ## Tests
 
@@ -151,7 +166,7 @@ inside the module (e.g. `nmoe/triton/nsa.py`, `nmoe/triton/swa.py`).
 
 ## Contributing
 
-nmoe is intentionally narrow and opinionated: B200-only (`sm_100a`), RDEP expert parallelism, TOML configs, and no NCCL all-to-all on the MoE path.
+nmoe is intentionally narrow and opinionated: B200-first (`sm_100a`), RDEP expert parallelism, TOML configs, and no NCCL all-to-all on the MoE path.
 We prefer one clear way to do each supported job over many interchangeable stacks.
 
 ## Acknowledgements
@@ -173,17 +188,18 @@ See `THIRD_PARTY_NOTICES.md` for license attributions.
 
 - Tensor parallel (ever)
 - NCCL all-to-all for MoE (ever)
-- H100/A100 support
-- Fallback paths
+- Multi-node training (this release)
+- A100 support
+- Fallback paths (silent downshifts)
 
-One hardware target. One distribution strategy. B200 or bust.
+Primary target: B200. Limited H100 support exists for BF16 speedruns only.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
-| `sm_100a` errors | You need B200. No workarounds. |
-| NVSHMEM init fails | Use IPC mode for single-node, or check bootstrap config |
+| `sm_100a` errors | You are running a B200-only path. For H100, use BF16 + SDPA (e.g. `n speedrun`). |
+| NVSHMEM init fails | Multi-node is out-of-scope for this release. Use single-node IPC. |
 | OOM | Reduce `batch_size` or `seq_len` |
 
 ## License

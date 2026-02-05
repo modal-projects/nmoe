@@ -207,10 +207,10 @@ export function GpuMonitor() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {gpus.map((gpu) => {
+              {gpus.map((gpu, idx) => {
                 const memPercent = (gpu.memoryUsed / gpu.memoryTotal) * 100
                 return (
-                  <TableRow key={gpu.id} className="font-mono text-xs">
+                  <TableRow key={`gpu-${gpu.id}-${idx}`} className="font-mono text-xs">
                     <TableCell className="py-2">{gpu.id}</TableCell>
                     <TableCell className="py-2" style={gpu.temperature > 70 ? { color: 'hsl(var(--chart-1))' } : { color: 'hsl(var(--chart-2))' }}>
                       {Math.floor(gpu.temperature)}C

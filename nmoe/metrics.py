@@ -2,6 +2,7 @@ import os
 import time
 import math
 import duckdb
+import zlib
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Optional
 import subprocess
@@ -56,6 +57,117 @@ def b200_peak_tflops(dtype: str) -> float:
     return B200_BF16_PEAK_TFLOPS
 
 
+def _crc32_u32(s: str) -> int:
+    # Stable across runs/processes (unlike Python's hash()) and fast.
+    return zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF
+
+
+@dataclass
+class _Nvfp4FlipAcc:
+    # Previous sampled bytes from a packed nvfp4 cache tensor (uint8 on GPU)
+    prev: torch.Tensor | None = None
+    # GPU accumulators (avoid .item() per step); flushed on log cadence
+    flips_sum: torch.Tensor | None = None  # int64 scalar on GPU
+    denom_sum: torch.Tensor | None = None  # int64 scalar on GPU
+    # Deterministic sample offset within the flattened byte view (cached per key)
+    offset: int | None = None
+
+
+class Nvfp4NibbleFlipTracker:
+    """Estimate nvfp4 code flip rate from packed expert weight caches.
+
+    Purpose (now): telemetry to correlate loss spikes with nvfp4 code churn/stall.
+    Purpose (soon): a minimal feedback signal for "resonant" nvfp4 training where
+    quantization dynamics act as intentional perturbations (no extra machinery).
+
+    We sample a fixed-size contiguous byte window from packed nvfp4 caches and
+    count how often each nibble changes vs the previous step.
+
+    - Constant overhead wrt model size.
+    - GPU-only accumulation; sync only on do_log steps.
+    """
+
+    SAMPLE_BYTES: int = 256 * 1024  # 256 KiB per tensor
+    TARGET_FRAC: float = 0.5        # "resonant" heuristic (no tuning knob yet)
+
+    def __init__(self, *, seed: int, keys: list[tuple[int, str]]):
+        self.seed = int(seed) & 0xFFFFFFFF
+        self.keys = keys  # (layer_idx, "W13_q"|"W2_q")
+        self._acc: dict[tuple[int, str], _Nvfp4FlipAcc] = {k: _Nvfp4FlipAcc() for k in keys}
+
+    def _offset(self, layer_idx: int, name: str, total_bytes: int) -> int:
+        if total_bytes <= self.SAMPLE_BYTES:
+            return 0
+        h = _crc32_u32(f"{self.seed}/{layer_idx}/{name}")
+        return int(h % (total_bytes - self.SAMPLE_BYTES + 1))
+
+    @torch.no_grad()
+    def _sample_u8(self, t: torch.Tensor, offset: int) -> torch.Tensor:
+        flat = t.view(torch.uint8).reshape(-1)
+        n = int(flat.numel())
+        if n <= self.SAMPLE_BYTES:
+            return flat.clone()
+        return flat.narrow(0, int(offset), int(self.SAMPLE_BYTES)).clone()
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        for (layer_idx, name), slot in self._acc.items():
+            try:
+                blk = model.blocks[layer_idx]
+                ffn = getattr(blk, "ffn", None)
+                cache = getattr(ffn, "_W_cache", None) if ffn is not None else None
+                if cache is None or getattr(cache, "profile", None) != "nvfp4":
+                    continue
+                t = getattr(cache, name, None)
+                if t is None or (not t.is_cuda):
+                    continue
+                if t.dtype != torch.uint8:
+                    continue
+            except Exception:
+                continue
+
+            # Cache deterministic sample offset once (tensor size is static within a run).
+            if slot.offset is None:
+                try:
+                    total_bytes = int(t.view(torch.uint8).numel())
+                except Exception:
+                    continue
+                slot.offset = self._offset(layer_idx, name, total_bytes)
+
+            cur = self._sample_u8(t, int(slot.offset))
+            prev = slot.prev
+            slot.prev = cur
+            if prev is None or prev.numel() != cur.numel():
+                continue
+
+            xor = prev ^ cur
+            # Count "nibble changed" events (two nibbles per byte) without host sync.
+            flips = torch.count_nonzero(xor & 0x0F) + torch.count_nonzero(xor & 0xF0)
+            denom = torch.full((), 2 * xor.numel(), device=xor.device, dtype=torch.int64)
+            if slot.flips_sum is None:
+                slot.flips_sum = flips.to(dtype=torch.int64)
+                slot.denom_sum = denom
+            else:
+                slot.flips_sum += flips.to(dtype=torch.int64)
+                slot.denom_sum += denom
+
+    @torch.no_grad()
+    def flush_means(self) -> dict[tuple[int, str], float]:
+        out: dict[tuple[int, str], float] = {}
+        for k, slot in self._acc.items():
+            if slot.flips_sum is None or slot.denom_sum is None:
+                continue
+            frac = (slot.flips_sum.float() / slot.denom_sum.float()).clamp_(0.0, 1.0)
+            out[k] = float(frac.item())  # sync only on do_log steps
+            slot.flips_sum.zero_()
+            slot.denom_sum.zero_()
+        return out
+
+
+_NVFP4_FLIP: Nvfp4NibbleFlipTracker | None = None
+_NVFP4_FLIP_DISABLED: bool = False
+
+
 @dataclass
 class MetricsState:
     ntokens_since_log: int
@@ -79,12 +191,12 @@ def _num_flops_per_token(model: torch.nn.Module, seq_len: int) -> float:
     """
     cfg = model.config
     H = cfg.dim
-    E = cfg.n_routed_experts
-    K = cfg.n_activated_experts
-    Dff_moe = cfg.moe_inter_dim
+    E = cfg.n_routed_experts or 0
+    K = cfg.n_activated_experts or 0
+    Dff_moe = getattr(cfg, 'moe_inter_dim', 0) or 0
     L = cfg.n_layers
     L_moe = max(0, cfg.n_layers - cfg.n_dense_layers)
-    S = getattr(cfg, 'n_shared_experts', 0)
+    S = getattr(cfg, 'n_shared_experts', 0) or 0
 
     # Get world_size to handle expert parallelism
     world = 1
@@ -95,7 +207,7 @@ def _num_flops_per_token(model: torch.nn.Module, seq_len: int) -> float:
         pass
 
     # Local expert params (sharded across GPUs)
-    n_local = E // world
+    n_local = E // world if E > 0 else 0
     per_moe_expert_params_local = n_local * (3 * H * Dff_moe)
 
     # Replicated params: router gate + shared experts
@@ -450,7 +562,7 @@ def log_step_torchtitan(
     if world > 1 and dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
         loss_t.div_(float(world))
-    loss_f = float(loss_t.item()) if is_rank0 else 0.0
+    loss_f = float(loss_t.item())
 
     # Grad L2 norm
     grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
@@ -459,7 +571,7 @@ def log_step_torchtitan(
         norm2 = local_norm.float() * local_norm.float()
         if world > 1 and dist.is_available() and dist.is_initialized():
             dist.all_reduce(norm2, op=dist.ReduceOp.SUM)
-        grad_norm = float(norm2.sqrt().item()) if is_rank0 else 0.0
+        grad_norm = float(norm2.sqrt().item())
     else:
         grad_norm = 0.0
 
@@ -534,32 +646,36 @@ def log_router_stats(model: torch.nn.Module, print_fn: Callable[[str], None]) ->
     bmax = max(bmaxs) if bmaxs else 0.0
     cv_str = f"{mean_cv:.2f}%" if mean_cv is not None else "--"
     if aux_vals:
-        print_fn(f"router: aux {aux:.4f}  cv {cv_str}  max {mx:.2f}%  bias[{bmin:.2f},{bmax:.2f}]")
+        line = f"router: aux {aux:.4f}  cv {cv_str}  max {mx:.2f}%  bias[{bmin:.2f},{bmax:.2f}]"
     else:
-        print_fn(f"router: cv {cv_str}  max {mx:.2f}%  bias[{bmin:.2f},{bmax:.2f}]")
+        line = f"router: cv {cv_str}  max {mx:.2f}%  bias[{bmin:.2f},{bmax:.2f}]"
+    print_fn(line)
 
 
 # ==========================
-# SQLite Metrics (built-in)
+# Metrics Writer (Parquet)
 # ==========================
 
 class MetricsWriter:
-    """Append-only DuckDB metrics writer for training telemetry.
+    """Parquet-per-step metrics writer for training telemetry.
+
+    Contract (authoritative live store):
+      /data/metrics/{run_id}/step_XXXXXXXX.parquet
 
     Schema (single source of truth):
-      metrics(run TEXT, tag TEXT, step INTEGER, ts_ms BIGINT, value DOUBLE,
-              PRIMARY KEY(run, tag, step))
+      metrics(run TEXT, tag TEXT, step INTEGER, ts_ms BIGINT, value DOUBLE)
     """
 
-    def __init__(self, db_path: str, run: str) -> None:
-        self.db_path = os.path.abspath(db_path)
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self.run = run
-        self._conn = duckdb.connect(self.db_path)
-        # DuckDB is embedded; per-rank DB files avoid concurrent writers.
+    def __init__(self, run_dir: str, run: str) -> None:
+        self.run_dir = os.path.abspath(str(run_dir))
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.run = str(run)
+        # Use DuckDB in-memory as a tiny buffer for the current step, then flush to parquet.
+        self._conn = duckdb.connect(":memory:")
+        self._dirty_steps: set[int] = set()
         self._conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS metrics (
+            CREATE TABLE IF NOT EXISTS buf (
               run   TEXT NOT NULL,
               tag   TEXT NOT NULL,
               step  INTEGER NOT NULL,
@@ -572,6 +688,11 @@ class MetricsWriter:
 
     def close(self) -> None:
         try:
+            for s in sorted(list(self._dirty_steps)):
+                self.flush_parquet(s)
+        except Exception:
+            pass
+        try:
             self._conn.close()
         except Exception:
             pass
@@ -582,9 +703,10 @@ class MetricsWriter:
     def insert(self, step: int, tag: str, value: float, ts_ms: Optional[int] = None) -> None:
         ts_val = int(self._now_ts_ms() if ts_ms is None else ts_ms)
         self._conn.execute(
-            "INSERT OR REPLACE INTO metrics(run, tag, step, ts_ms, value) VALUES (?,?,?,?,?)",
+            "INSERT OR REPLACE INTO buf(run, tag, step, ts_ms, value) VALUES (?,?,?,?,?)",
             [self.run, tag, int(step), ts_val, float(value)],
         )
+        self._dirty_steps.add(int(step))
 
     def insert_many(self, step: int, items: Iterable[tuple[str, float]], ts_ms: Optional[int] = None) -> None:
         ts_val = int(self._now_ts_ms() if ts_ms is None else ts_ms)
@@ -592,19 +714,69 @@ class MetricsWriter:
         if not rows:
             return
         self._conn.executemany(
-            "INSERT OR REPLACE INTO metrics(run, tag, step, ts_ms, value) VALUES (?,?,?,?,?)",
+            "INSERT OR REPLACE INTO buf(run, tag, step, ts_ms, value) VALUES (?,?,?,?,?)",
             rows,
         )
+        self._dirty_steps.add(int(step))
+
+    def flush_parquet(self, step: int) -> None:
+        """Flush current step data to parquet for concurrent readers. Call on rank 0 only."""
+        try:
+            s = int(step)
+            if s not in self._dirty_steps:
+                return
+            parquet_path = os.path.join(self.run_dir, f"step_{s:08d}.parquet")
+            tmp_path = os.path.join(self.run_dir, f"step_{s:08d}.parquet.tmp")
+            parquet_sql = parquet_path.replace("'", "''")
+            tmp_sql = tmp_path.replace("'", "''")
+            if os.path.exists(parquet_path):
+                existing_sql = f"SELECT run, tag, step, ts_ms, value FROM read_parquet('{parquet_sql}')"
+            else:
+                existing_sql = "SELECT run, tag, step, ts_ms, value FROM buf WHERE 0=1"
+            self._conn.execute(
+                "COPY ("
+                "  SELECT run, tag, step, ts_ms, value FROM ("
+                "    SELECT *, row_number() OVER (PARTITION BY run, tag, step ORDER BY ts_ms DESC) AS rn"
+                "    FROM ("
+                f"      {existing_sql}"
+                "      UNION ALL"
+                f"      SELECT run, tag, step, ts_ms, value FROM buf WHERE step = {s}"
+                "    )"
+                "  ) WHERE rn = 1"
+                "  ORDER BY tag"
+                f") TO '{tmp_sql}' (FORMAT PARQUET)"
+            )
+            os.replace(tmp_path, parquet_path)  # Atomic rename
+            # Keep the in-memory buffer bounded.
+            self._conn.execute(f"DELETE FROM buf WHERE step = {s}")
+            self._dirty_steps.discard(s)
+        except Exception:
+            pass
 
     # ---- Convenience helpers ----
-    def log_core(self, step: int, *, loss: float, lr: float,
+    def log_core(self, step: int, *, loss: float, lr_dense: float,
+                 lr_router: Optional[float] = None,
+                 lr_expert: Optional[float] = None,
+                 lr_muon: Optional[float] = None,
+                 grad_norm: Optional[float] = None,
+                 tokens_seen: Optional[float] = None,
                  tokens_per_s_gpu: Optional[float] = None,
                  ms_per_step: Optional[float] = None,
                  tflops: Optional[float] = None,
                  loader_wait_ms: Optional[float] = None,
                  memory_current_alloc_gib: Optional[float] = None,
                  memory_max_alloc_gib: Optional[float] = None) -> None:
-        items: list[tuple[str, float]] = [("train/loss", loss), ("optimizer/lr", lr)]
+        items: list[tuple[str, float]] = [("train/loss", loss), ("optimizer/lr", lr_dense), ("optimizer/lr_dense", lr_dense)]
+        if lr_router is not None:
+            items.append(("optimizer/lr_router", lr_router))
+        if lr_expert is not None:
+            items.append(("optimizer/lr_expert", lr_expert))
+        if lr_muon is not None:
+            items.append(("optimizer/lr_muon", lr_muon))
+        if grad_norm is not None:
+            items.append(("train/grad_norm", grad_norm))
+        if tokens_seen is not None:
+            items.append(("train/tokens_seen", tokens_seen))
         if tokens_per_s_gpu is not None:
             items.append(("throughput/tokens_per_s_gpu", tokens_per_s_gpu))
         if ms_per_step is not None:
@@ -747,13 +919,13 @@ def start_metrics(run_id: Optional[str] = None,
         rank = 0
 
     try:
-        # Per-rank writer; each rank writes its own DuckDB file.
+        # Rank-0-only writer. Live metrics are written as per-step parquet files under:
+        #   {metrics_dir}/{run_id}/step_XXXXXXXX.parquet
         rid = run_id or os.getenv('NMOE_RUN') or time.strftime('%Y%m%d-%H%M%S')
         mdir = metrics_dir or os.getenv('NMOE_METRICS_DIR', '/data/metrics')
         run_dir = os.path.join(mdir, rid)
         os.makedirs(run_dir, exist_ok=True)
-        db_path = os.path.join(run_dir, f"rank_{rank}.duckdb")
-        writer = MetricsWriter(db_path, run=rid)
+        writer = MetricsWriter(run_dir, run=rid) if rank == 0 else None
     except Exception:
         writer = None
 
@@ -854,7 +1026,11 @@ def log_training_step(step: int,
                       *,
                       model: torch.nn.Module,
                       loss: torch.Tensor,
-                      lr: float,
+                      lr_dense: float,
+                      lr_router: Optional[float] = None,
+                      lr_expert: Optional[float] = None,
+                      lr_muon: Optional[float] = None,
+                      tokens_seen: int,
                       tokens_this_step: int,
                       state: MetricsState,
                       print_fn: Callable[[str], None],
@@ -880,6 +1056,38 @@ def log_training_step(step: int,
             do_log = True
     except Exception:
         pass
+
+    # ------------------------------------------------------------
+    # NVFP4 flip-rate tracker: update every step, flush on do_log.
+    # Auto-enables only when nvfp4 MoE caches exist AND DuckDB writer exists.
+    # ------------------------------------------------------------
+    global _NVFP4_FLIP, _NVFP4_FLIP_DISABLED
+    if _NVFP4_FLIP is None and (not _NVFP4_FLIP_DISABLED) and ctx is not None and ctx.writer is not None:
+        try:
+            # Find first+last nvfp4 MoE layers as canaries.
+            moe_layer_idxs: list[int] = []
+            for i, blk in enumerate(getattr(model, "blocks", [])):
+                ffn = getattr(blk, "ffn", None)
+                if getattr(ffn, "_dtype", None) != "nvfp4":
+                    continue
+                if not bool(getattr(ffn, "_use_blockscaled", False)):
+                    continue
+                moe_layer_idxs.append(int(i))
+            if moe_layer_idxs:
+                canaries = [moe_layer_idxs[0], moe_layer_idxs[-1]]
+                seed = _crc32_u32(str(ctx.writer.run))
+                keys = [(i, "W13_q") for i in canaries] + [(i, "W2_q") for i in canaries]
+                _NVFP4_FLIP = Nvfp4NibbleFlipTracker(seed=seed, keys=keys)
+            else:
+                _NVFP4_FLIP_DISABLED = True
+        except Exception:
+            _NVFP4_FLIP_DISABLED = True
+
+    if _NVFP4_FLIP is not None:
+        try:
+            _NVFP4_FLIP.update(model)
+        except Exception:
+            pass
 
     # Console prints rank0 only.
     is_rank0 = _is_rank0()
@@ -941,7 +1149,12 @@ def log_training_step(step: int,
             ctx.writer.log_core(
                 step,
                 loss=float(out.get('loss', 0.0)),
-                lr=float(lr),
+                lr_dense=float(lr_dense),
+                lr_router=(float(lr_router) if lr_router is not None else None),
+                lr_expert=(float(lr_expert) if lr_expert is not None else None),
+                lr_muon=(float(lr_muon) if lr_muon is not None else None),
+                grad_norm=(float(out['grad_norm']) if out.get('grad_norm') is not None else None),
+                tokens_seen=float(tokens_seen),
                 tokens_per_s_gpu=out.get('tps'),
                 ms_per_step=out.get('ms_per_step'),
                 tflops=out.get('tflops'),
@@ -1007,6 +1220,11 @@ def log_training_step(step: int,
                     items.append((f"time_ms/r{rank}/" + tag[len('time_ms/'):], val))
                 elif tag.startswith('comm/'):
                     items.append((f"comm/r{rank}/" + tag[len('comm/'):], val))
+            # NVFP4 nibble flip fraction (per-rank, canary MoE layers)
+            if _NVFP4_FLIP is not None:
+                for (layer_idx, name), frac in _NVFP4_FLIP.flush_means().items():
+                    items.append((f"quant/r{rank}/nvfp4/layer_{layer_idx:02d}/{name}_nibble_flip_frac", float(frac)))
+                    items.append((f"quant/r{rank}/nvfp4/layer_{layer_idx:02d}/{name}_resonance_error", float(frac - Nvfp4NibbleFlipTracker.TARGET_FRAC)))
             if items:
                 ctx.writer.insert_many(step, items)
         except Exception:
@@ -1029,5 +1247,9 @@ def log_training_step(step: int,
             log_router_stats(model, print_out)
         except Exception:
             pass
+
+    # Flush parquet for concurrent readers (rank 0 only, at log cadence)
+    if is_rank0 and ctx is not None and ctx.writer is not None:
+        ctx.writer.flush_parquet(step)
 
     return out

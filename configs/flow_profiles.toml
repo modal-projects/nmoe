@@ -120,8 +120,7 @@ pretrain = "olmo3_1025_pretrain_6T"
 
 ###############################################################################
 # proxy_fineweb - FineWeb-Edu 100B proxy run
-# Purpose: Validate frozen-expert training with HYDRA filtering
-# Duration: Depends on HYDRA throughput
+# Purpose: FineWeb-Edu proxy run for frozen-expert validation
 ###############################################################################
 [flow.proxy_fineweb]
 mode = "proxy"
@@ -133,21 +132,9 @@ sample_temperature = 1.0
 pretrain = "fineweb_edu_100b"
 
 ###############################################################################
-# hydra_fixture - Small HYDRA smoke fixture (CI / local validation)
-###############################################################################
-[flow.hydra_fixture]
-mode = "dev"
-stages = ["pretrain"]
-tokens_b = 0.001
-sample_temperature = 1.0
-
-[flow.hydra_fixture.mixture]
-pretrain = "hydra_fixture_pretrain"
-
-###############################################################################
 # CLI flow profiles (validation/bench)
 #
-# `python -m nmoe.data.cli flow --config configs/flow_profiles.toml --profile mini ...`
+# `python -m nmoe.data.cli prep-mixture --flow-profiles configs/flow_profiles.toml --flow proxy_fineweb ...`
 ###############################################################################
 [profiles.mini]
 mixture = "configs/mixtures/fineweb_edu_proxy.toml"
@@ -156,11 +143,3 @@ stage = "pretrain"
 splits = "train"
 seed = 123
 limit = 1000
-
-[profiles.hydra_fixture]
-mixture = "configs/mixtures/hydra_fixture.toml"
-flow = "hydra_fixture"
-stage = "pretrain"
-splits = "train"
-seed = 123
-limit = 500

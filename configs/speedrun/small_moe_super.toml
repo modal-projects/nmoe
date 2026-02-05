@@ -26,9 +26,9 @@ eos_token_id = 50256
 loss_mask_eos = false
 
 # Data
-data_path = "/data/fineweb10B_gpt2_npy/train"
+data_path = "/data/speedrun/train"
 validation_enabled = true
-validation_data_path = "/data/fineweb10B_gpt2_npy/val"
+validation_data_path = "/data/speedrun/val"
 validation_every = 128
 validation_steps = 20
 

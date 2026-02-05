@@ -729,7 +729,7 @@ __device__ int   d_world_block;
 // Inference IPC Transport (FP8 activations + local routing metadata)
 //
 // This is a minimal, decode-focused transport primitive intended to replace
-// DeepEP in nmoe.serve. It uses CUDA IPC pointers plus a graph-replay-safe
+// earlier DeepEP-style IPC inference plumbing. It uses CUDA IPC pointers plus a graph-replay-safe
 // tag barrier (barrier_block) for system-scope ordering.
 //
 // Contract (v0):

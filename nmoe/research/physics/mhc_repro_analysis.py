@@ -1,10 +1,10 @@
 """
-Analyze artifacts produced by `python -m nmoe.physics.mhc_repro`.
+Analyze artifacts produced by `python -m nmoe.research.physics.mhc_repro`.
 
 Terminal-first, no plotting deps: emits JSON + TSV suitable for paper plots.
 
 Run:
-  python -m nmoe.physics.mhc_repro_analysis --input /tmp/mhc_repro
+  python -m nmoe.research.physics.mhc_repro_analysis --input /tmp/mhc_repro
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ def main() -> int:
     root = args.input
     runs_path = root / "runs.json"
     if not runs_path.exists():
-        raise SystemExit(f"Missing {runs_path}. Run `python -m nmoe.physics.mhc_repro --output ...` first.")
+        raise SystemExit(f"Missing {runs_path}. Run `python -m nmoe.research.physics.mhc_repro --output ...` first.")
 
     runs = json.loads(runs_path.read_text(encoding="utf-8"))
     out_dir = root / "analysis"

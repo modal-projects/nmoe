@@ -32,13 +32,10 @@ append_eos = true
 # -----------------------------------------------------------------------------
 # PREP DEFAULTS - Applied unless overridden per-task
 # -----------------------------------------------------------------------------
-# Prep order: raw -> hygiene -> exact_dedup_text -> hydra -> tokenize ->
-#             exact_dedup_tokens -> near_dedup_tokens -> shards
+# Prep order (historical): raw -> hygiene -> tokenize -> shards
 [corpus.prep_defaults]
 hygiene = true              # Cheap text normalization/filtering
 exact_dedup_text = true     # Exact hash dedup on normalized text (before tokenize)
-hydra_filter = true         # HYDRA quality scoring (after text dedup, before tokenize)
-hydra_audit = true          # Write HYDRA scores to audit sidecar
 exact_dedup_tokens = false  # Exact hash dedup on token sequences (after tokenize)
 near_dedup_tokens = false   # MinHash near-dedup on token sequences (expensive)
 

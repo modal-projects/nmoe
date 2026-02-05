@@ -30,9 +30,21 @@ def _maybe_add_repo_third_party_to_sys_path(*, repo_root: str | Path | None = No
   third_party = root / "third_party"
   if not third_party.is_dir():
     return
-  p = str(third_party)
-  if p not in sys.path:
-    sys.path.insert(0, p)
+
+  # Vendored deps are placed as self-contained import roots, e.g.:
+  # - third_party/quack/quack/...
+  # - third_party/flash_attn/flash_attn/...
+  # Add the package roots (not just third_party/).
+  candidates = [
+    third_party / "quack",
+    third_party / "flash_attn",
+    third_party / "nvshmem" / "nvshmem4py",
+  ]
+  for path in candidates:
+    if path.is_dir():
+      p = str(path)
+      if p not in sys.path:
+        sys.path.insert(0, p)
 
 
 def _require_b200():
@@ -47,11 +59,11 @@ def _require_b200():
     )
 
 
-def init(seed: int = 42) -> tuple[int, int]:
+def init(seed: int = 42, *, require_b200: bool = True) -> tuple[int, int]:
   """Initialize runtime for training. Returns (rank, world).
 
   Handles:
-  - Platform check (B200 required)
+  - Platform check (B200 required unless explicitly relaxed)
   - Seeds and TF32
   - Device assignment (LOCAL_RANK env var)
   - Distributed init (automatic for multi-GPU)
@@ -62,7 +74,10 @@ def init(seed: int = 42) -> tuple[int, int]:
   - Multi-node: same as single-node, world > local_world
   """
   _maybe_add_repo_third_party_to_sys_path()
-  _require_b200()
+  if require_b200:
+    _require_b200()
+  elif not torch.cuda.is_available():
+    raise RuntimeError("CUDA device required.")
 
   # Seeds and TF32
   torch.backends.cuda.matmul.allow_tf32 = True

@@ -21,9 +21,9 @@ eos_token_id = 50256
 loss_mask_eos = false
 
 # Data
-data_path = "/data/fineweb10B_gpt2_npy/train"
+data_path = "/data/speedrun/train"
 validation_enabled = true
-validation_data_path = "/data/fineweb10B_gpt2_npy/val"
+validation_data_path = "/data/speedrun/val"
 validation_every = 250
 # Match modded-nanogpt val_tokens=10,485,760:
 # 10,485,760 / (batch_size * seq_len) = 10,485,760 / 393,216 = 26.666... -> 27 steps
@@ -78,4 +78,3 @@ log_every = 100
 # Note: 3.28 is modded-nanogpt's target with vanilla attention + tricks.
 # Our MLA/SWA architecture may achieve different loss - this is a comparison baseline.
 target_loss = 3.28
-

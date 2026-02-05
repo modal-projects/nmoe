@@ -9,7 +9,8 @@
 //   - NVFP4 E2M1 conversion (PTX, guarded by NMOE_ENABLE_PTX_E2M1)
 //   - Pack helpers
 //
-// Target: sm_100a (Blackwell B200). Will fail loudly on older architectures.
+// Target: sm_100a (Blackwell B200).
+// BF16/FP8 primitives are also used for SM90 (H100) BF16 bring-up; NVFP4 remains SM100-only.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -22,9 +23,11 @@
 #define NMOE_HAS_CUDA_FP8 0
 #endif
 
-// Architecture guard - device code requires sm_100+
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-#error "nmoe/ptx.cu requires sm_100a or newer (Blackwell)."
+// Architecture guard:
+// - We support BF16/FP8 IPC primitives on SM90+ (H100/B200).
+// - NVFP4 (E2M1) conversion remains SM100-only and is separately guarded below.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 900)
+#error "nmoe/ptx.cu requires sm_90 or newer."
 #endif
 
 namespace nmoe {

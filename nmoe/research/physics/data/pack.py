@@ -4,7 +4,7 @@ Pack synthetic samples into .npy shards for nmoe training.
 Streams SyntheticMix → pads to seq_len+1 (no truncation) → ShardedWriter → .npy + .idx + manifest.json
 
 Usage:
-    python -m nmoe.physics.data.pack \
+    python -m nmoe.research.physics.data.pack \
         --output /data/physics/depo-mano-v1 \
         --dataset depo-mano \
         --tasks depo:1.0:n_entities=100,max_hops=8 mano:1.0:depth=5 \
@@ -26,7 +26,7 @@ from typing import Iterator
 import numpy as np
 
 from nmoe.data.sinks import ShardedWriter
-from nmoe.physics.data.generators import (
+from nmoe.research.physics.data.generators import (
     Sample, SyntheticMix, depo, brevo, mano,
     BOS, EOS, ANSWER_START,
 )
@@ -80,7 +80,7 @@ def pack_split(
     rng = random.Random(seed)
 
     source_info = {
-        "generator": "nmoe.physics.data.pack",
+        "generator": "nmoe.research.physics.data.pack",
         "split": split,
         "n_samples": n_samples,
         "seq_len": seq_len,
@@ -137,21 +137,21 @@ def main():
         epilog="""
 Examples:
     # Depo-only dataset
-    python -m nmoe.physics.data.pack \\
+    python -m nmoe.research.physics.data.pack \\
         --output /data/physics/depo-v1 \\
         --dataset depo \\
         --tasks "depo:1.0:n_entities=100,max_hops=8" \\
         --n-train 100000 --n-valid 1000 --seq-len 512
 
     # Ngram (Markov order-2) dataset
-    python -m nmoe.physics.data.pack \\
+    python -m nmoe.research.physics.data.pack \\
         --output /data/physics/ngram-v1 \\
         --dataset ngram \\
         --tasks "ngram:1.0:n_symbols=512,n_steps=128,table_seed=0" \\
         --n-train 100000 --n-valid 1000 --seq-len 256
 
     # Mixed Depo + Mano
-    python -m nmoe.physics.data.pack \\
+    python -m nmoe.research.physics.data.pack \\
         --output /data/physics/depo-mano-v1 \\
         --dataset depo-mano \\
         --tasks "depo:1.0:n_entities=100,max_hops=8" "mano:1.0:depth=5,ops=asm" \\

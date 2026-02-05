@@ -17,7 +17,7 @@ These native probes emit `ProbeEvent` records (JSONL) via `ProbeWriter`.
 We keep the generic probes for exploratory debugging, but they are not the
 paper's primary measurement path.
 """
-from nmoe.physics.probe.schema import (
+from nmoe.research.physics.probe.schema import (
     ProbeEvent,
     ProbeWriter,
     TensorStats,
@@ -26,24 +26,24 @@ from nmoe.physics.probe.schema import (
     filter_events,
 )
 
-from nmoe.physics.probe.atlas import AtlasProbe, AtlasConfig, compare_atlases
-from nmoe.physics.probe.trajectory import (
+from nmoe.research.physics.probe.atlas import AtlasProbe, AtlasConfig, compare_atlases
+from nmoe.research.physics.probe.trajectory import (
     TrajectoryProbe, TrajectoryConfig, TrajectoryProbeWithHooks,
     compute_rgb_components,
 )
-from nmoe.physics.probe.mhc import MHCProbe, MHCConfig, compute_mixing_stability
+from nmoe.research.physics.probe.mhc import MHCProbe, MHCConfig, compute_mixing_stability
 
 # Mental model validation probes
-from nmoe.physics.probe.overlap import (
+from nmoe.research.physics.probe.overlap import (
     OverlapProbe, OverlapConfig, measure_overlap_compatibility,
 )
-from nmoe.physics.probe.gain import (
+from nmoe.research.physics.probe.gain import (
     GainProbe, GainConfig, measure_gain_per_layer, detect_late_band,
 )
 
 # Keep generic probes for future use
-from nmoe.physics.probe.capture import Probe, ProbeConfig
-from nmoe.physics.probe.analysis import load_probe_log, plot_metric_over_training
+from nmoe.research.physics.probe.capture import Probe, ProbeConfig
+from nmoe.research.physics.probe.analysis import load_probe_log, plot_metric_over_training
 
 __all__ = [
     # Schema

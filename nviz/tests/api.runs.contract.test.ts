@@ -8,8 +8,8 @@ import os from 'node:os'
 
 import { DuckDBInstance } from '@duckdb/node-api'
 
-describe('/api/runs contract (DuckDB + SQLite merge)', () => {
-  it('includes sqlite status and duckdb last_step', async () => {
+describe('/api/runs contract (Parquet + SQLite merge)', () => {
+  it('includes sqlite status and parquet last_step', async () => {
     const root = mkdtempSync(join(os.tmpdir(), 'nviz-fixture-'))
     const metricsDir = join(root, 'metrics')
     const expDb = join(root, 'experiments.db')
@@ -17,27 +17,24 @@ describe('/api/runs contract (DuckDB + SQLite merge)', () => {
     process.env.NVIZ_METRICS_DIR = metricsDir
     process.env.NVIZ_EXPERIMENTS_DB = expDb
 
-    // Create DuckDB metrics for runA.
+    const sqlLit = (s: string) => `'${s.replaceAll("'", "''")}'`
+
+    // Create Parquet metrics for runA.
     const runA = 'runA'
     mkdirSync(join(metricsDir, runA), { recursive: true })
-    const dbPath = join(metricsDir, runA, 'rank_0.duckdb')
     {
-      const inst = await DuckDBInstance.create(dbPath)
+      const inst = await DuckDBInstance.create(':memory:')
       const conn = await inst.connect()
       try {
-        await conn.run(`
-          CREATE TABLE IF NOT EXISTS metrics (
-            run   TEXT NOT NULL,
-            tag   TEXT NOT NULL,
-            step  INTEGER NOT NULL,
-            ts_ms BIGINT NOT NULL,
-            value DOUBLE NOT NULL,
-            PRIMARY KEY (run, tag, step)
-          );
-        `)
         const now = Date.now()
-        await conn.run(`INSERT OR REPLACE INTO metrics VALUES ('${runA}','train/loss',1,${now - 2000},10.0)`)
-        await conn.run(`INSERT OR REPLACE INTO metrics VALUES ('${runA}','train/loss',2,${now - 1000},8.0)`)
+        const p1 = join(metricsDir, runA, 'step_00000001.parquet')
+        const p2 = join(metricsDir, runA, 'step_00000002.parquet')
+        await conn.run(
+          `COPY (SELECT ${sqlLit(runA)} AS run, 'train/loss' AS tag, 1::INTEGER AS step, ${now - 2000}::BIGINT AS ts_ms, 10.0::DOUBLE AS value) TO ${sqlLit(p1)} (FORMAT PARQUET)`
+        )
+        await conn.run(
+          `COPY (SELECT ${sqlLit(runA)} AS run, 'train/loss' AS tag, 2::INTEGER AS step, ${now - 1000}::BIGINT AS ts_ms, 8.0::DOUBLE AS value) TO ${sqlLit(p2)} (FORMAT PARQUET)`
+        )
       } finally {
         try { await conn.close() } catch {}
         try { await inst.close() } catch {}

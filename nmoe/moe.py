@@ -27,8 +27,14 @@ def expert(
   W3: torch.Tensor,
   W2: torch.Tensor,
   offs_pad: torch.Tensor,
+  activation: str = "swiglu",
 ) -> torch.Tensor:
-  """Expert MLP: Y = (SiLU(X @ W1) * (X @ W3)) @ W2
+  """Expert MLP with configurable activation.
+
+  Activations:
+    - swiglu: Y = (SiLU(X @ W1) * (X @ W3)) @ W2
+    - relu_squared: Y = ReLU(X @ W1)² @ W2
+    - squared_reglu: Y = (ReLU(X @ W1)² * (X @ W3)) @ W2
 
   BF16 path using torch._grouped_mm.
 
@@ -37,6 +43,7 @@ def expert(
     W1, W3: [E, H, Dff] gate/up weights
     W2: [E, Dff, H] down weight
     offs_pad: [E] cumulative padded offsets from rdep
+    activation: activation function name
 
   Returns:
     [M_pad, H] BF16 output (caller uses dest to select valid rows)
@@ -45,14 +52,25 @@ def expert(
     return Xe_pad
 
   H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
-  H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
-  return torch._grouped_mm(F.silu(H1).mul_(H3), W2, offs=offs_pad)
+
+  if activation == "swiglu":
+    H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+    A = F.silu(H1) * H3
+  elif activation == "relu_squared":
+    A = F.relu(H1) ** 2
+  elif activation == "squared_reglu":
+    H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+    A = F.relu(H1) ** 2 * H3
+  else:
+    raise ValueError(f"Unknown activation: {activation}")
+
+  return torch._grouped_mm(A, W2, offs=offs_pad)
 
 
 class _MoEBf16Fused(torch.autograd.Function):
   @staticmethod
   def forward(ctx, rdep: Rdep, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
-              W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor) -> torch.Tensor:
+              W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor, activation: str = "swiglu") -> torch.Tensor:
     device = x.device
     stream = torch.cuda.current_stream(device)
 
@@ -99,6 +117,7 @@ class _MoEBf16Fused(torch.autograd.Function):
           stream,
         )
       ctx.rdep = rdep
+      ctx.activation = activation
       ctx.save_for_backward(x, eid, gates, W1, W3, W2)
       return out_f32.to(dtype=torch.bfloat16)
 
@@ -114,7 +133,7 @@ class _MoEBf16Fused(torch.autograd.Function):
     Xe_pad = torch.empty(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
     _C.gather_xe_bf16(Xe_pad.data_ptr(), int(M_recv), int(max_pad), stream)
 
-    Ye_pad = expert(Xe_pad, W1, W3, W2, offs_pad)
+    Ye_pad = expert(Xe_pad, W1, W3, W2, offs_pad, activation)
     _C.return_scatter_from_pad_bf16(
       Ye_pad.data_ptr(),
       out_f32.data_ptr(),
@@ -123,6 +142,7 @@ class _MoEBf16Fused(torch.autograd.Function):
     )
 
     ctx.rdep = rdep
+    ctx.activation = activation
     ctx.save_for_backward(x, eid, gates, W1, W3, W2)
     return out_f32.to(dtype=torch.bfloat16)
 
@@ -130,6 +150,7 @@ class _MoEBf16Fused(torch.autograd.Function):
   def backward(ctx, dOut: torch.Tensor):
     x, eid, gates, W1, W3, W2 = ctx.saved_tensors
     rdep: Rdep = ctx.rdep
+    activation: str = ctx.activation
     device = x.device
     stream = torch.cuda.current_stream(device)
 
@@ -202,7 +223,7 @@ class _MoEBf16Fused(torch.autograd.Function):
       else:
         dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
 
-      return None, dX, None, dGates, dW1, dW3, dW2
+      return None, dX, None, dGates, dW1, dW3, dW2, None
 
     max_pad = (int(M_recv) + int(offs_pad.numel()) * (align - 1) + (align - 1)) // align * align
     offs_pad[-1] = int(max_pad)
@@ -216,7 +237,7 @@ class _MoEBf16Fused(torch.autograd.Function):
 
     with torch.enable_grad():
       Xe_pad = Xe_pad.requires_grad_(True)
-      Ye_pad = expert(Xe_pad, W1, W3, W2, offs_pad)
+      Ye_pad = expert(Xe_pad, W1, W3, W2, offs_pad, activation)
 
     dYe_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
     dGate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
@@ -289,13 +310,14 @@ class _MoEBf16Fused(torch.autograd.Function):
       )
 
     dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
-    return None, dX, None, dGates, dW1, dW3, dW2
+    return None, dX, None, dGates, dW1, dW3, dW2, None
 
 
 class _MoEBlockscaledFused(torch.autograd.Function):
   @staticmethod
   def forward(ctx, rdep: Rdep, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
-              W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor, W_cache) -> torch.Tensor:
+              W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor, W_cache,
+              activation: str = "swiglu") -> torch.Tensor:
     device = x.device
     stream = torch.cuda.current_stream(device)
 
@@ -337,6 +359,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         _C.return_scatter_from_pad_blockscaled(dummy_ye_pad.data_ptr(), out_f32.data_ptr(), 0, int(T), int(K), stream)
       ctx.rdep = rdep
       ctx.W_cache = W_cache
+      ctx.activation = activation
       ctx.T = int(T)
       ctx.H = int(H)
       ctx.K = int(K)
@@ -367,6 +390,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
     ctx.rdep = rdep
     ctx.W_cache = W_cache
+    ctx.activation = activation
     ctx.T = int(T)
     ctx.H = int(H)
     ctx.K = int(K)
@@ -378,6 +402,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     x, eid, gates, W1, W3, W2 = ctx.saved_tensors
     rdep: Rdep = ctx.rdep
     W_cache = ctx.W_cache
+    activation: str = ctx.activation
 
     device = dOut.device
     stream = torch.cuda.current_stream(device)
@@ -452,7 +477,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       else:
         dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
 
-      return None, dX, None, dGates, dW1, dW3, dW2, None
+      return None, dX, None, dGates, dW1, dW3, dW2, None, None, None
 
     # Compute max_pad and extend last expert's padded region
     max_pad = (int(M_recv) + E * (align - 1) + (align - 1)) // align * align
@@ -515,21 +540,41 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     copy_event.record(stream)
     Dff = int(W2.size(1))
     H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
-    H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
     dA = torch._grouped_mm(dYe_pad, W2.transpose(1, 2), offs=offs_pad)
-    A = torch.empty_like(H1)
-    dH1 = torch.empty_like(H1)
-    dH3 = torch.empty_like(H3)
-    _C.swiglu_bwd_bf16(
-      H1.data_ptr(), int(Dff),
-      H3.data_ptr(), int(Dff),
-      dA.data_ptr(), int(Dff),
-      A.data_ptr(), int(Dff),
-      dH1.data_ptr(), int(Dff),
-      dH3.data_ptr(), int(Dff),
-      int(max_pad), int(Dff),
-      stream,
-    )
+
+    # Activation-specific forward and backward
+    if activation == "swiglu":
+      H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+      A = torch.empty_like(H1)
+      dH1 = torch.empty_like(H1)
+      dH3 = torch.empty_like(H3)
+      _C.swiglu_bwd_bf16(
+        H1.data_ptr(), int(Dff),
+        H3.data_ptr(), int(Dff),
+        dA.data_ptr(), int(Dff),
+        A.data_ptr(), int(Dff),
+        dH1.data_ptr(), int(Dff),
+        dH3.data_ptr(), int(Dff),
+        int(max_pad), int(Dff),
+        stream,
+      )
+    elif activation == "relu_squared":
+      # A = relu(H1)²; dH1 = 2 * relu(H1) * dA
+      relu_H1 = F.relu(H1)
+      A = relu_H1 ** 2
+      dH1 = 2 * relu_H1 * dA
+      H3 = torch.empty(0, device=device, dtype=H1.dtype)  # unused
+      dH3 = torch.empty(0, device=device, dtype=H1.dtype)  # unused
+    elif activation == "squared_reglu":
+      # A = relu(H1)² * H3; dH1 = 2 * relu(H1) * H3 * dA; dH3 = relu(H1)² * dA
+      H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+      relu_H1 = F.relu(H1)
+      relu_H1_sq = relu_H1 ** 2
+      A = relu_H1_sq * H3
+      dH1 = 2 * relu_H1 * H3 * dA
+      dH3 = relu_H1_sq * dA
+    else:
+      raise ValueError(f"Unknown activation: {activation}")
 
     # SonicMoE dGate identity: dGate = ⟨A, dA⟩ instead of ⟨dOut, Ye⟩
     # This avoids recomputing Ye_pad in both single-GPU and distributed modes.
@@ -540,6 +585,11 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       int(M_recv), int(Dff),
       stream,
     )
+    # Correct SonicMoE identity: it requires dA_ungated = dY @ W2.T.
+    # We formed dA from dYe_pad where dYe = gate * dY (needed for weight grads),
+    # so dA = gate * dA_ungated and ⟨A, dA⟩ = gate * dGate_true.
+    gate_sorted.clamp_min_(1e-12)
+    dGate_sorted.div_(gate_sorted)
     if is_dist:
       # Distributed: send dGate back to source ranks via IPC
       _C.send_dgate_dist_bf16(
@@ -581,18 +631,22 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       stream,
     )
 
-    dW3 = torch.empty_like(W3)
-    _C.bf16_wgrad_w13_cublaslt(
-      Xe_pad.data_ptr(),
-      dH3.data_ptr(),
-      dW3.data_ptr(),
-      offs_host.data_ptr(),
-      int(E), int(H), int(Dff),
-      stream,
-    )
-
-    dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
-    dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
+    # relu_squared doesn't use W3, so dW3/dH3 gradients are zero
+    if activation == "relu_squared":
+      dW3 = torch.zeros_like(W3)
+      dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
+    else:
+      dW3 = torch.empty_like(W3)
+      _C.bf16_wgrad_w13_cublaslt(
+        Xe_pad.data_ptr(),
+        dH3.data_ptr(),
+        dW3.data_ptr(),
+        offs_host.data_ptr(),
+        int(E), int(H), int(Dff),
+        stream,
+      )
+      dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
+      dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
     dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
       dX_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
@@ -614,4 +668,4 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       )
 
     dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
-    return None, dX, None, dGates, dW1, dW3, dW2, None
+    return None, dX, None, dGates, dW1, dW3, dW2, None, None, None

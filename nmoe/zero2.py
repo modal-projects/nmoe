@@ -224,9 +224,9 @@ def step_dense_adamw(
       rs_in2d = rs_in.view(world, shard_chunk)
       cursors = [0 for _ in range(world)]
 
-      with time_ctx('time_ms/zero2_reduce_scatter'):
-        for shard_off in range(0, shard_size, shard_chunk):
-          chunk_len = min(shard_chunk, shard_size - shard_off)
+      for shard_off in range(0, shard_size, shard_chunk):
+        chunk_len = min(shard_chunk, shard_size - shard_off)
+        with time_ctx('time_ms/zero2_pack'):
           # Zero rs_in for this chunk (required to avoid leaking previous chunk values).
           rs_in2d.zero_()
 
@@ -252,11 +252,18 @@ def step_dense_adamw(
                   row[(o0 - g0):(o1 - g0)].copy_(gv[(o0 - a):(o1 - a)])
               i += 1
 
+        barrier_on = os.getenv("NMOE_ZERO2_BARRIER", "0") in ("1", "true", "True")
+        if barrier_on and world > 1:
+          with time_ctx("time_ms/zero2_barrier"):
+            dist.barrier(group=pg)
+
+        with time_ctx('time_ms/zero2_rs'):
           if world == 1:
             rs_out[:chunk_len].copy_(rs_in2d[0, :chunk_len])
           else:
             dist.reduce_scatter_tensor(rs_out, rs_in, op=dist.ReduceOp.AVG, group=pg)
 
+        with time_ctx('time_ms/zero2_adam_update'):
           g = rs_out[:chunk_len]
           p = param_shard[shard_off:(shard_off + chunk_len)]
           m = exp_avg[shard_off:(shard_off + chunk_len)]

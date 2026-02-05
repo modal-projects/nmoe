@@ -263,9 +263,9 @@ def main() -> None:
     spec_by_name = {t.get("name"): t for t in tasks_spec if isinstance(t, dict) and t.get("name")}
 
     # Build the real model (GPU) for scoring
-    from nmoe.config import Config
+    from nmoe.config import Config, upgrade_cfg_dict
     from nmoe.model import Transformer
-    cfg = Config(**cfg_dict)
+    cfg = Config(**upgrade_cfg_dict(cfg_dict))
     model = Transformer(cfg).cuda().eval()
     # Load state if present
     try:
@@ -369,7 +369,7 @@ def main() -> None:
             results.append(EvalResult(task=name, raw_acc=0.0, centered_acc=0.0, n=0))
 
         elif scorer == "judge":
-            # Placeholder until HYDRA judge harness is added (count as 0)
+            # Placeholder until a judge-based harness is added (count as 0)
             results.append(EvalResult(task=name, raw_acc=0.0, centered_acc=0.0, n=0))
         else:
             results.append(EvalResult(task=name, raw_acc=0.0, centered_acc=0.0, n=0))

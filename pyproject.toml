@@ -11,9 +11,39 @@ requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "The NMoE Authors" }]
 
- # Container-first: the supported install path is via the Dockerfiles in `docker/`.
- # We intentionally do not declare a pip-first dependency graph here.
-dependencies = []
+dependencies = [
+  "tiktoken",
+  "pybind11",
+  "openai_harmony",
+  "numpy",
+  "nvidia-cutlass-dsl",
+  "apache-tvm-ffi",
+  "cuda-python==12.8.0",
+  "duckdb",
+  "datasets",
+  "typer",
+  "rich",
+  "jupyter",
+  "notebook",
+]
+
+[project.scripts]
+n = "nmoe.cli.main:main"
+
+[project.optional-dependencies]
+research = [
+  "matplotlib",
+  "pandas",
+  "seaborn",
+  "tqdm",
+  "rose-pine-jupyterlab",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "ruff",
+]
 
 [tool.setuptools.packages.find]
 include = ["nmoe*"]
@@ -21,3 +51,5 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "nmoe.data" = ["*.pt", "*.json"]
+
+

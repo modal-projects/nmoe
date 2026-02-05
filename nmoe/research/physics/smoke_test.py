@@ -4,7 +4,7 @@ Physics smoke test: pack → train → probe → verify acceptance criteria.
 Single command to verify Paper-A quality probing infrastructure.
 
 Usage:
-    python -m nmoe.physics.smoke_test [--steps=20] [--seed=42]
+    python -m nmoe.research.physics.smoke_test [--steps=20] [--seed=42]
 
 Acceptance criteria verified:
 1. Non-degenerate geometry (margin, rho, overlap have spread)
@@ -55,7 +55,7 @@ def main():
     # === Step 1: Pack synthetic data ===
     if not (output_dir / "train").exists():
         ok = run_cmd([
-            sys.executable, "-m", "nmoe.physics.data.pack",
+            sys.executable, "-m", "nmoe.research.physics.data.pack",
             "--output", str(output_dir),
             "--dataset", "smoke",
             "--tasks", f"depo:1.0:n_entities=50,max_hops=4", f"mano:1.0:depth=3",
@@ -118,7 +118,7 @@ checkpoint_dir = "{ckpt_dir}"
     import numpy as np
     from nmoe.config import Config
     from nmoe.model import Transformer
-    from nmoe.physics.probe.trajectory import TrajectoryProbeWithHooks, TrajectoryConfig
+    from nmoe.research.physics.probe.trajectory import TrajectoryProbeWithHooks, TrajectoryConfig
 
     cfg = Config(
         vocab_size=10240,

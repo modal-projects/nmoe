@@ -180,11 +180,11 @@ export function RouterHealthHeatmap() {
           </div>
 
           {/* Rows */}
-          {sortedLayers.map(layer => {
+          {sortedLayers.map((layer, idx) => {
             const status = getRowStatus(layer)
             return (
               <div
-                key={layer.layer}
+                key={`layer-${layer.layer}-${idx}`}
                 className="grid grid-cols-[60px_1fr_1fr_1fr_1fr] gap-2 items-center py-2 px-2 rounded transition-colors"
                 style={{ backgroundColor: getRowBgColor(status) }}
               >

@@ -4,7 +4,6 @@ import { GET as listHandler } from '@/app/api/datasets/route'
 import { GET as previewHandler } from '@/app/api/datasets/preview/route'
 import { GET as metaHandler } from '@/app/api/datasets/meta/route'
 import { GET as manifestHandler } from '@/app/api/datasets/manifest/route'
-import { GET as pipelineHandler } from '@/app/api/datasets/pipeline/route'
 import { GET as shardStatsHandler } from '@/app/api/datasets/shard/stats/route'
 import { GET as shardWindowHandler } from '@/app/api/datasets/shard/window/route'
 import { GET as indexHeaderHandler } from '@/app/api/datasets/index/header/route'
@@ -171,56 +170,6 @@ describe('/api/datasets contract', () => {
       expect(body.start).toBe(4)
       expect(body.end).toBe(7)
       expect(body.tokens).toEqual([4, 5, 999])
-    }
-
-    // Flow/pipeline inspection
-    mkdirSync(join(root, 'flow', 'hydra_grades'), { recursive: true })
-    mkdirSync(join(root, 'flow', 'training_shards'), { recursive: true })
-    writeFileSync(join(root, 'flow', 'flow_spec.json'), JSON.stringify({ config_path: 'cfg.toml', config: { run: { name: 'toy' } } }, null, 2))
-    writeFileSync(join(root, 'flow', 'raw_docs.jsonl'), '{"id":"a","text":"x"}\n')
-    writeFileSync(join(root, 'flow', 'kept_docs.jsonl'), '{"id":"a","text":"x"}\n')
-    writeFileSync(join(root, 'flow', 'rephrased_docs.jsonl'), '{"id":"a_v0","text":"y"}\n')
-    writeFileSync(join(root, 'flow', 'hydra_grades', 'summary.json'), JSON.stringify({
-      total: 10,
-      kept: 4,
-      band: 6,
-      dropped: 0,
-      per_source: { fineweb: { kept: 4, band: 6, dropped: 0 } },
-      tau_drop: 0.1,
-      tau_keep: 1.23,
-    }, null, 2))
-
-    writeNpyUint32(join(root, 'flow', 'training_shards', 'shard.npy'), tokens)
-    writeIdx(join(root, 'flow', 'training_shards', 'shard.idx'), [[0, 4], [4, 7], [7, 9]])
-    writeFileSync(join(root, 'flow', 'training_shards', 'manifest.json'), JSON.stringify({
-      dataset: 'toy',
-      version: 'v1',
-      tokenizer: 'toy',
-      vocab_size: 1000,
-      eos_token_id: 999,
-      dtype: 'uint32',
-      created_at: 'now',
-      total_tokens: tokens.length,
-      total_documents: 3,
-      num_shards: 1,
-      shards: [{ path: 'shard.npy', index_path: 'shard.idx', num_tokens: tokens.length, num_documents: 3, checksum: 'x' }],
-      source_info: {},
-    }))
-
-    {
-      const url = new URL('http://localhost/api/datasets/pipeline')
-      url.searchParams.set('path', 'flow')
-      const req = new NextRequest(url)
-      const res = await pipelineHandler(req)
-      const body = await res.json() as any
-      expect(res.ok).toBe(true)
-      expect(body.is_flow_dir).toBe(true)
-      expect(body.stages.raw).toBe(true)
-      expect(body.stages.hydra).toBe(true)
-      expect(body.stages.prep).toBe(true)
-      expect(body.hydra_summary.total).toBe(10)
-      expect(body.training_shards.manifest.found).toBe(true)
-      expect(body.training_shards.manifest.dataset).toBe('toy')
     }
 
     try { rmSync(root, { recursive: true, force: true }) } catch {}

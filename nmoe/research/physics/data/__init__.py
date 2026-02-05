@@ -6,6 +6,6 @@ Each generator produces (tokens, labels, metadata) where:
 - labels: which tokens to compute loss on (0=ignore, 1=predict)
 - metadata: task-specific info for analysis (difficulty, structure, etc.)
 """
-from nmoe.physics.data.generators import depo, brevo, mano, SyntheticMix, Sample
+from nmoe.research.physics.data.generators import depo, brevo, mano, SyntheticMix, Sample
 
 __all__ = ["depo", "brevo", "mano", "SyntheticMix", "Sample"]

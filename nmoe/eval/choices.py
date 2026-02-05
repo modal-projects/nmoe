@@ -73,7 +73,8 @@ def _forward_hidden(model: torch.nn.Module, tokens: torch.Tensor) -> torch.Tenso
     if not hasattr(model, "rope"):
         raise TypeError("model must have rope buffers (RotaryEmbedding)")
 
-    x = model.embedding(tokens) * float(getattr(model, "mup_scale_factor", 1.0))
+    embed_gain = float(getattr(model, "fp4_embed_gain", getattr(model, "mup_scale_factor", 1.0)))
+    x = model.embedding(tokens) * embed_gain
     seqlen = int(tokens.size(1))
     cos = model.rope.cos[:seqlen].to(tokens.device)
     sin = model.rope.sin[:seqlen].to(tokens.device)
@@ -160,7 +161,7 @@ def _score_option_logprob(
     if lm_head is None or not hasattr(lm_head, "weight"):
         raise TypeError("model must expose lm_head.weight")
 
-    logits_scale = float(getattr(model, "logits_scale_factor", 1.0))
+    logits_scale = float(getattr(model, "fp4_logits_gain", getattr(model, "logits_scale_factor", 1.0)))
     W = lm_head.weight.detach()  # [V,D]
 
     # Positions predicting option tokens: pos = prompt_len + j - 1
@@ -367,10 +368,10 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     obj = torch.load(args.snapshot, map_location="cpu")
     cfg_dict = obj.get("config", {})
-    from nmoe.config import Config
+    from nmoe.config import Config, upgrade_cfg_dict
     from nmoe.model import Transformer
 
-    cfg = Config(**cfg_dict)
+    cfg = Config(**upgrade_cfg_dict(cfg_dict))
     model = Transformer(cfg).cuda()
     model.load_state_dict(obj.get("model_state", {}), strict=False)
 

@@ -15,12 +15,12 @@ inside this harness. This module is about: (i) correct math/parameterization, (i
 stability curves, and (iii) propagation diagnostics (Amax gain magnitude).
 
 Execution model
-  - Uses the same nmoe synthetic data packer (nmoe.physics.data.pack) and runs entirely
+  - Uses the same nmoe synthetic data packer (nmoe.research.physics.data.pack) and runs entirely
     from scripts (terminal-first, artifact-driven).
   - Intended for moonlet/micro scale runs only.
 
 Run
-  python -m nmoe.physics.mhc_repro --output /tmp/mhc_repro --steps 2000
+  python -m nmoe.research.physics.mhc_repro --output /tmp/mhc_repro --steps 2000
 """
 
 from __future__ import annotations
@@ -483,7 +483,7 @@ def _maybe_pack(cfg: ReproConfig) -> None:
         [
             sys.executable,
             "-m",
-            "nmoe.physics.data.pack",
+            "nmoe.research.physics.data.pack",
             "--output",
             str(data_dir),
             "--dataset",

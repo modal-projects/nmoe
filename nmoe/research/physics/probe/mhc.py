@@ -22,7 +22,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from nmoe.physics.probe.schema import (
+from nmoe.research.physics.probe.schema import (
     ProbeEvent, ProbeWriter, TensorStats, QUANTILES,
 )
 

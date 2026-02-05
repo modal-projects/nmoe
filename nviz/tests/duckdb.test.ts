@@ -7,13 +7,13 @@ import { DuckDBInstance } from '@duckdb/node-api'
 import { allRuns, scalarsSampled } from '@/lib/server/duckdb'
 
 let dir: string
-let dbPath: string
+let runDir: string
 
 beforeAll(() => {
   dir = mkdtempSync(join(os.tmpdir(), 'nviz-metrics-'))
   process.env.NVIZ_METRICS_DIR = dir
-  mkdirSync(join(dir, 'runA'), { recursive: true })
-  dbPath = join(dir, 'runA', 'rank_0.duckdb')
+  runDir = join(dir, 'runA')
+  mkdirSync(runDir, { recursive: true })
 })
 
 afterAll(() => {
@@ -22,23 +22,20 @@ afterAll(() => {
 
 describe('duckdb layer', () => {
   beforeAll(async () => {
-    const inst = await DuckDBInstance.create(dbPath)
+    const sqlLit = (s: string) => `'${s.replaceAll("'", "''")}'`
+    const inst = await DuckDBInstance.create(':memory:')
     const conn = await inst.connect()
     try {
-      await conn.run(`
-        CREATE TABLE IF NOT EXISTS metrics (
-          run   TEXT NOT NULL,
-          tag   TEXT NOT NULL,
-          step  INTEGER NOT NULL,
-          ts_ms BIGINT NOT NULL,
-          value DOUBLE NOT NULL,
-          PRIMARY KEY (run, tag, step)
-        );
-      `)
       const now = Date.now()
-      await conn.run(`INSERT OR REPLACE INTO metrics VALUES ('runA','train/loss',1,${now-3000},10.0)`)
-      await conn.run(`INSERT OR REPLACE INTO metrics VALUES ('runA','train/loss',2,${now-2000},7.5)`)
-      await conn.run(`INSERT OR REPLACE INTO metrics VALUES ('runA','train/loss',3,${now-1000},6.2)`)
+      await conn.run(
+        `COPY (SELECT 'runA' AS run, 'train/loss' AS tag, 1::INTEGER AS step, ${now - 3000}::BIGINT AS ts_ms, 10.0::DOUBLE AS value) TO ${sqlLit(join(runDir, 'step_00000001.parquet'))} (FORMAT PARQUET)`
+      )
+      await conn.run(
+        `COPY (SELECT 'runA' AS run, 'train/loss' AS tag, 2::INTEGER AS step, ${now - 2000}::BIGINT AS ts_ms, 7.5::DOUBLE AS value) TO ${sqlLit(join(runDir, 'step_00000002.parquet'))} (FORMAT PARQUET)`
+      )
+      await conn.run(
+        `COPY (SELECT 'runA' AS run, 'train/loss' AS tag, 3::INTEGER AS step, ${now - 1000}::BIGINT AS ts_ms, 6.2::DOUBLE AS value) TO ${sqlLit(join(runDir, 'step_00000003.parquet'))} (FORMAT PARQUET)`
+      )
     } finally {
       try { await conn.close() } catch {}
       try { await inst.close() } catch {}

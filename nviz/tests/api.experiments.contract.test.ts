@@ -51,24 +51,18 @@ describe('/api/experiments endpoints', () => {
     ])
     db.close()
 
-    // DuckDB seed for runA.
+    const sqlLit = (s: string) => `'${s.replaceAll("'", "''")}'`
+
+    // Parquet seed for runA.
     mkdirSync(join(metricsDir, 'runA'), { recursive: true })
-    const dbPath = join(metricsDir, 'runA', 'rank_0.duckdb')
-    const inst = await DuckDBInstance.create(dbPath)
+    const parquetPath = join(metricsDir, 'runA', 'step_00000005.parquet')
+    const inst = await DuckDBInstance.create(':memory:')
     const conn = await inst.connect()
     try {
-      await conn.run(`
-        CREATE TABLE IF NOT EXISTS metrics (
-          run   TEXT NOT NULL,
-          tag   TEXT NOT NULL,
-          step  INTEGER NOT NULL,
-          ts_ms BIGINT NOT NULL,
-          value DOUBLE NOT NULL,
-          PRIMARY KEY (run, tag, step)
-        );
-      `)
       const now = Date.now()
-      await conn.run(`INSERT OR REPLACE INTO metrics VALUES ('runA','train/loss',5,${now},3.14)`)
+      await conn.run(
+        `COPY (SELECT 'runA' AS run, 'train/loss' AS tag, 5::INTEGER AS step, ${now}::BIGINT AS ts_ms, 3.14::DOUBLE AS value) TO ${sqlLit(parquetPath)} (FORMAT PARQUET)`
+      )
     } finally {
       try { await conn.close() } catch {}
       try { await inst.close() } catch {}
@@ -99,4 +93,3 @@ describe('/api/experiments endpoints', () => {
     try { rmSync(root, { recursive: true, force: true }) } catch {}
   })
 })
-

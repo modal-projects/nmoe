@@ -11,7 +11,8 @@ def forward_hidden(model: torch.nn.Module, tokens: torch.Tensor) -> torch.Tensor
     if not hasattr(model, "rope"):
         raise TypeError("model must have rope buffers (RotaryEmbedding)")
 
-    x = model.embedding(tokens) * float(getattr(model, "mup_scale_factor", 1.0))
+    embed_gain = float(getattr(model, "fp4_embed_gain", getattr(model, "mup_scale_factor", 1.0)))
+    x = model.embedding(tokens) * embed_gain
     seqlen = int(tokens.size(1))
     cos = model.rope.cos[:seqlen].to(tokens.device)
     sin = model.rope.sin[:seqlen].to(tokens.device)
@@ -97,4 +98,3 @@ def argmax_vocab_chunked(
     if best_idx is None:
         raise RuntimeError("empty lm_head_weight")
     return best_idx
-

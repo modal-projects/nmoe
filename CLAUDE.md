@@ -178,34 +178,20 @@ We borrow ideas; we do not depend on these at runtime.
 # DEVELOPMENT WORKFLOW
 
 ## Session Start
-- ALWAYS read AGENTS.md and AGENTS.md.local first
+- ALWAYS read AGENTS.md first
+- If present, also read AGENTS.md.local (local, untracked)
 - If continuing from previous session, review conversation history/summary
 
-## kubectl Sync Workflow
-```bash
-# Set pod name
-export POD=$(kubectl get pods -l app=nmoe,stage=debug -o jsonpath='{.items[0].metadata.name}')
-
-# Sync file to pod
-kubectl cp nmoe/train.py $POD:/workspace/nmoe/nmoe/train.py
-
-# Sync directory
-kubectl cp nmoe/csrc $POD:/workspace/nmoe/nmoe/csrc
-
-# Run on pod
-kubectl exec $POD -- bash -c "source /workspace/nmoe/.venv/bin/activate && cd /workspace/nmoe && <command>"
-```
-
-**Rules**:
-- NEVER run GPU-dependent code locally - always sync and run on pod
-- Data is on cluster at /data - use kubectl exec to interact
-- Always source venv: `source /workspace/nmoe/.venv/bin/activate`
-- Set PYTHONPATH: `export PYTHONPATH=/workspace/nmoe`
+## Execution Environment (Public Contract)
+- Supported execution path is container-first (`docker/` + TOML configs).
+- Host bootstrap (`scripts/bootstrap.sh`) is explicitly opt-in for quick iteration on cloud instances.
+- Do not commit provider/cluster runbooks, hostnames, IPs, or secrets into tracked files.
+- If you need GPUs, run where GPUs exist (container/Kubernetes/remote host); do not pretend-run GPU code locally.
 
 ## CUDA Build Protocol
 - ONLY run `make` when CUDA source files (*.cu, *.cuh, *.cpp in csrc/) actually changed
 - NEVER delete/overwrite compiled .so files without checking if rebuild needed
-- Check timestamps: `kubectl exec $POD -- ls -la /workspace/nmoe/nmoe/csrc/*.so`
+- Check timestamps: `ls -la nmoe/csrc/*.so` (or equivalent inside your container/remote env)
 - NEVER use `make clean` unless absolutely necessary
 - Full CUDA rebuild takes 45+ minutes - unnecessary rebuilds are unacceptable
 
@@ -262,8 +248,8 @@ When user says "ultrathink":
 # PROMPT TEMPLATES
 
 ## DEBUG Protocol
-1. CHECK LOGS: `kubectl exec $POD -- tail -100 /tmp/<logfile>`
-2. VERIFY STATE: `kubectl exec $POD -- ls -la <path>`
+1. CHECK LOGS: `tail -100 <logfile>` (or your environment's equivalent)
+2. VERIFY STATE: `ls -la <path>`
 3. CHECK GIT DIFF: `git diff HEAD -- <relevant-files>`
 4. FORM HYPOTHESIS based on evidence (not speculation)
 5. DESIGN MINIMAL TEST
@@ -304,7 +290,7 @@ Awaiting approval to proceed.
 5. **LAZY TROUBLESHOOTING** - Every diagnosis needs supporting data
 6. **SCATTERED IMPORTS** - All imports at top, tab = 2 spaces
 7. **CONFIG EXPLOSION** - Update existing configs, don't create new ones
-8. **RUNNING LOCALLY** - Always sync to pod and run there
+8. **RUNNING GPU CODE WITHOUT GPU** - Use the supported container/remote execution path
 9. **VERBOSITY WHEN ACTION REQUESTED** - "just X" means do X immediately
 10. **IGNORING CONVERSATION HISTORY** - Previous working configs may be in history
 11. **IMPLEMENTING BEFORE APPROVAL** - Propose first, wait for explicit approval

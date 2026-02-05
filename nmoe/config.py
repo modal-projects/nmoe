@@ -57,6 +57,16 @@ class Config:
   # RoPE
   max_position_embeddings: int = 8192
   rope_theta: float = 50000.0
+
+  # NVFP4 I/O gains (NVFP4-only).
+  #
+  # NVFP4 training uses BF16 master weights but computes forward/backward through
+  # FP4 cached weights. These gains calibrate the embedding activations and final
+  # logits scale for stable STE training.
+  #
+  # For non-NVFP4 runs, these must be left unset.
+  fp4_embed_gain: Optional[float] = None
+  fp4_logits_gain: Optional[float] = None
   rope_scaling_factor: float = 1.0
   rope_ntk_alpha: float = 1.0
   rope_ntk_beta: float = 32.0
@@ -69,9 +79,13 @@ class Config:
   aux_loss_alpha: float = 0.0
   norm_topk_prob: bool = True
   route_scale: float = 1.0
+  routed_scaling_factor: float = 1.0  # Post-norm scaling for gradient flow (NVFP4: 2.446)
 
   # Precision
   dtype: Optional[str] = "bf16"  # bf16 | fp8 | nvfp4
+
+  # Activation function
+  activation: str = "swiglu"  # swiglu | relu_squared | squared_reglu
 
   # =============================================================================
   # Optimizer
@@ -90,6 +104,19 @@ class Config:
   lr_muon: float = 0.023  # Muon learning rate (matches modded-nanogpt)
   muon_momentum: float = 0.95
   muon_weight_decay: float = 1.2  # Higher WD for Muon (matches modded-nanogpt)
+
+  # Expert optimizer override:
+  # - "" / None: auto (ExpertAdamW for fp8/nvfp4, AdamW for bf16)
+  # - "adamw": always use torch.optim.AdamW for experts (even for fp8/nvfp4; requires post-step cache refresh)
+  # - "muon": Muon-style expert optimizer (polar retraction per expert matrix)
+  # - "ks2d": KS2D (compressed PSGD + polar retraction + post-adaptivity) for expert matrices
+  expert_opt: Optional[str] = None
+
+  # KS2D (expert optimizer) hyperparams.
+  ks2d_rank: int = 8
+  ks2d_codebook_update_freq: int = 100
+  ks2d_warmup_steps: Optional[int] = None  # If None, defaults to cfg.warmup_steps
+  ks2d_max_update_rms: float = 1.0
 
   # =============================================================================
   # Scheduler (WSD - Warmup-Sustain-Decay)
@@ -192,19 +219,13 @@ class Config:
   perl_irc_window_steps: int = 256  # Invariance window length (steps) for IRC guardrails
 
   # =============================================================================
-  # Multi-Token Prediction (optional)
-  # =============================================================================
-  mtp_depth: int = 0  # D=0 disabled, D=1+ enables MTP with D additional predictions
-  mtp_lambda: float = 0.3  # Initial MTP loss weight
-  mtp_lambda_step_tokens: int = 0  # Tokens before lambda steps to 0.1 (0 = no step)
-
-  # =============================================================================
   # Validation (optional)
   # =============================================================================
   validation_enabled: bool = False
   validation_data_path: Optional[str] = None
   validation_every: int = 500
   validation_steps: int = 100
+  validation_log_bpb: bool = False
   target_loss: Optional[float] = None  # Stop when val_loss <= target (speedruns)
 
   # =============================================================================
@@ -221,7 +242,8 @@ class Config:
   eval_mode: str = "reserved_gpu"  # inline | reserved_gpu | k8s_job
   eval_every: int = 0               # steps; 0 disables
   eval_tasks: str = "core"         # optional shorthand; prefer tasks file
-  eval_tasks_file: str = "configs/eval/tasks.toml"
+  eval_tasks_file: str = "configs/eval/core.toml"
+  eval_bundle_dir: str = ""  # If empty, uses {data_root}/eval/eval_bundle
   eval_budget_max_examples: int = 500
   eval_budget_max_time_s: int = 300
   eval_reserved_gpu_id: int = 7
@@ -325,7 +347,7 @@ from typing import Any, Union
 
 # Allowlisted env var prefixes (security: prevent accidental secret leakage)
 # NOTE: HF_ intentionally excluded (HF_TOKEN is sensitive)
-_ENV_VAR_PREFIXES = ("NMOE_", "HYDRA_")
+_ENV_VAR_PREFIXES = ("NMOE_",)
 
 
 class ConfigEnvError(Exception):
@@ -401,7 +423,7 @@ def load_toml(path: Union[str, Path]) -> dict:
     """Load TOML config with env var expansion.
 
     Supports ${VAR} and ${VAR:-default} syntax.
-    Only NMOE_ and HYDRA_ prefixed vars are allowed.
+    Only NMOE_ prefixed vars are allowed.
 
     Args:
         path: Path to TOML file
@@ -419,3 +441,21 @@ def load_toml(path: Union[str, Path]) -> dict:
     obj = _expand_env_vars(obj, str(path))
     _check_unresolved(obj, str(path))
     return obj
+
+
+def upgrade_cfg_dict(cfg_dict: dict) -> dict:
+    """Upgrade legacy config keys to current names.
+
+    This keeps old configs runnable without re-writing them, while keeping the
+    in-code surface area minimal.
+    """
+    out = dict(cfg_dict)
+    if "mup_scale_factor" in out:
+        if "fp4_embed_gain" in out:
+            raise ValueError("Config specifies both mup_scale_factor and fp4_embed_gain; use fp4_embed_gain.")
+        out["fp4_embed_gain"] = out.pop("mup_scale_factor")
+    if "logits_scale_factor" in out:
+        if "fp4_logits_gain" in out:
+            raise ValueError("Config specifies both logits_scale_factor and fp4_logits_gain; use fp4_logits_gain.")
+        out["fp4_logits_gain"] = out.pop("logits_scale_factor")
+    return out

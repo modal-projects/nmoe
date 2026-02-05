@@ -1,5 +1,5 @@
 """
-nmoe.data - Data loading, preprocessing, inference, and mixture utilities.
+nmoe.data - Data loading, preprocessing, and mixture utilities.
 
 Primary exports:
 - build_loader: Main entry point for creating data loaders
@@ -49,9 +49,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "JSONLSource": (".sources", "JSONLSource"),
     "TextFileSource": (".sources", "TextFileSource"),
     "ArrowSource": (".sources", "ArrowSource"),
-    "HydraScore": (".sources", "HydraScore"),
-    "HydraScoringSource": (".sources", "HydraScoringSource"),
-    "HydraFilteredSource": (".sources", "HydraFilteredSource"),
     "create_source": (".sources", "create_source"),
     # Sinks
     "ShardWriter": (".sinks", "ShardWriter"),
@@ -70,29 +67,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "pack_document": (".transforms", "pack_document"),
     "get_shard_id": (".transforms", "get_shard_id"),
     "make_file_name": (".transforms", "make_file_name"),
-    # Scoring
-    "build_prompt": (".score", "build_prompt"),
-    "right_trim": (".score", "right_trim"),
-    "grade_prompts": (".score", "grade_prompts"),
-    "compute_aggregated": (".score", "compute_aggregated"),
-    "compute_aggregated_code": (".score", "compute_aggregated_code"),
-    # Rephrasing
-    "format_prompt": (".rephrase", "format_prompt"),
-    "create_parser": (".rephrase", "create_parser"),
-    "stop_tokens": (".rephrase", "stop_tokens"),
-    "sample_top_p": (".rephrase", "sample_top_p"),
-    # Dedup
-    "minhash_signature": (".dedup", "minhash_signature"),
-    "jaccard_from_signature": (".dedup", "jaccard_from_signature"),
-    "stream_near_dedup": (".dedup", "stream_near_dedup"),
-    "LSHIndex": (".dedup", "LSHIndex"),
-    "exact_hash": (".dedup", "exact_hash"),
-    "dedup_exact": (".dedup", "dedup_exact"),
-    "dedup_line_level": (".dedup", "dedup_line_level"),
-    "dedup_paragraph_level": (".dedup", "dedup_paragraph_level"),
-    # Diversity
-    "cluster_embeddings": (".diversity", "cluster_embeddings"),
-    "coverage_metrics": (".diversity", "coverage_metrics"),
 }
 
 
@@ -131,9 +105,6 @@ __all__ = [
     "JSONLSource",
     "TextFileSource",
     "ArrowSource",
-    "HydraScore",
-    "HydraScoringSource",
-    "HydraFilteredSource",
     "create_source",
     # Sinks
     "ShardWriter",
@@ -152,27 +123,4 @@ __all__ = [
     "pack_document",
     "get_shard_id",
     "make_file_name",
-    # Scoring
-    "build_prompt",
-    "right_trim",
-    "grade_prompts",
-    "compute_aggregated",
-    "compute_aggregated_code",
-    # Rephrasing
-    "format_prompt",
-    "create_parser",
-    "stop_tokens",
-    "sample_top_p",
-    # Dedup
-    "minhash_signature",
-    "jaccard_from_signature",
-    "stream_near_dedup",
-    "LSHIndex",
-    "exact_hash",
-    "dedup_exact",
-    "dedup_line_level",
-    "dedup_paragraph_level",
-    # Diversity
-    "cluster_embeddings",
-    "coverage_metrics",
 ]

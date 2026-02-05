@@ -386,7 +386,13 @@ class _Purger(threading.Thread):
         base = Path(self.base)
         if not base.exists():
             return
-        iters = sorted([p for p in base.iterdir() if p.is_dir() and p.name.startswith("iter_")])
+        # Only purge finalized checkpoints (those with manifest.json). Never delete
+        # in-progress iteration dirs; they may still be mid-write on another rank
+        # or in the async saver thread.
+        iters = sorted([
+            p for p in base.iterdir()
+            if p.is_dir() and p.name.startswith("iter_") and (p / "manifest.json").exists()
+        ])
         if len(iters) <= self.keep_last:
             return
         for p in iters[:-self.keep_last]:
@@ -639,7 +645,7 @@ def build_states(
     dp_state: dict[str, Any] = {
         'step': step,
         'model_expert': expert_sd,
-        'optimizer': optimizer.state_dict(),
+        'optimizer': optimizer.state_dict() if optimizer is not None else None,
         'loader': loader.state_dict() if hasattr(loader, 'state_dict') else None,
         'rng': {
             'torch': torch.random.get_rng_state(),
@@ -708,7 +714,8 @@ def load_state(
     print_fn(f'Loading checkpoint: {path}')
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
     model.load_state_dict(ckpt['model_expert'], strict=False)
-    optimizer.load_state_dict(ckpt['optimizer'])
+    if optimizer is not None and ckpt.get('optimizer') is not None:
+        optimizer.load_state_dict(ckpt['optimizer'])
 
     if loader is not None and ckpt.get('loader'):
         loader.load_state_dict(ckpt['loader'])

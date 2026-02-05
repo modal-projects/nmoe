@@ -1,6 +1,6 @@
 # FineWeb-Edu 100B Proxy
 #
-# Purpose: Validate frozen-expert training pipeline with HYDRA filtering
+# Purpose: Validate frozen-expert training pipeline on a small, reproducible slice
 # Dataset: fineweb_edu_100B (223GB, pre-shuffled)
 # Total: ~100B tokens
 

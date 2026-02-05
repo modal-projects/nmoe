@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
-from nmoe.physics.data.generators import (
+from nmoe.research.physics.data.generators import (
     Sample,
     BOS, EOS, QUERY_START, QUERY_END, ANSWER_START,
     DEPO_ENTITY_MIN, DEPO_ENTITY_MAX,
@@ -628,7 +628,7 @@ def evaluate_token_batch(
 
 if __name__ == "__main__":
     import random
-    from nmoe.physics.data.generators import depo, brevo, mano
+    from nmoe.research.physics.data.generators import depo, brevo, mano
 
     rng = random.Random(42)
 

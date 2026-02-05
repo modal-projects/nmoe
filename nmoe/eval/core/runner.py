@@ -202,7 +202,7 @@ def _evaluate_example(
     if lm_head is None or not hasattr(lm_head, "weight"):
         raise TypeError("model must expose lm_head.weight")
     W = lm_head.weight.detach()
-    logits_scale = float(getattr(model, "logits_scale_factor", 1.0))
+    logits_scale = float(getattr(model, "fp4_logits_gain", getattr(model, "logits_scale_factor", 1.0)))
 
     if task.task_type in ("multiple_choice", "schema"):
         mean_nll = _mean_nll_by_sequence(
@@ -377,8 +377,7 @@ def run_core_live(
         tasks = load_core_tasks(Path(tasks_file))
         baselines = bundle.load_random_baselines()
 
-        # Metrics go under {metrics_dir}/eval/{run_id}/rank_0.duckdb to avoid writer contention with training.
-        # Only rank0 writes metrics: other ranks do not have meaningful counters.
+        # Metrics go under {metrics_dir}/eval/{run_id}/step_XXXXXXXX.parquet (rank-0 only).
         metrics_dir = str(getattr(cfg, "metrics_dir", "/data/metrics"))
         metrics_ctx = start_metrics(run_id=str(run_id), metrics_dir=str(Path(metrics_dir) / "eval")) if rank == 0 else None
 
@@ -482,10 +481,10 @@ def main(argv: list[str] | None = None) -> None:
     snap = Path(args.snapshot)
     cfg_dict, model_state, meta = _load_snapshot(snap)
 
-    from nmoe.config import Config
+    from nmoe.config import Config, upgrade_cfg_dict
     from nmoe.model import Transformer
 
-    cfg = Config(**cfg_dict)
+    cfg = Config(**upgrade_cfg_dict(cfg_dict))
     # Eval buffers: bound batch_size for RDEP allocations; does not change params.
     # Must be >= the largest eval batch we will forward (max choices in MC tasks).
     cfg.batch_size = 16
@@ -519,7 +518,7 @@ def main(argv: list[str] | None = None) -> None:
     tasks = load_core_tasks(Path(args.tasks_file))
     baselines = bundle.load_random_baselines()
 
-    # Metrics go under {metrics_dir}/eval/{run_id}/rank_*.duckdb to avoid writer contention with training.
+    # Metrics go under {metrics_dir}/eval/{run_id}/step_XXXXXXXX.parquet (rank-0 only).
     run_id = str(meta.get("run_id") or os.getenv("NMOE_RUN") or cfg.experiment_id or "eval")
     metrics_dir = str(cfg_dict.get("metrics_dir") or "/data/metrics")
     metrics_ctx = start_metrics(run_id=run_id, metrics_dir=str(Path(metrics_dir) / "eval"))

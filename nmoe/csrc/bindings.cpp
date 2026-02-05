@@ -20,26 +20,7 @@ extern "C" {
   // Init
   void rdep_init(int rank, int world, int local_world);
   int  rdep_get_mode();
-  bool rdep_has_nvshmem();
 
-#ifdef WITH_NVSHMEM
-  // NVSHMEM functions (from rdep_nvshmem.cu) - use rdep_ prefix to avoid conflicts
-  void rdep_nvshmem_get_uid(void* uid_out);
-  int  rdep_nvshmem_get_uid_size();
-  void rdep_nvshmem_init_with_uid(const void* uid, int rank, int world, int local_world);
-  void rdep_nvshmem_finalize();
-  void rdep_nvshmem_alloc_bf16(size_t capacity, int H, int n_local);
-  void rdep_nvshmem_alloc_blockscaled(size_t capacity, int H, int n_local, int profile);
-  void rdep_nvshmem_barrier();
-  void rdep_nvshmem_quiet();
-  // NVSHMEM IPC buffer functions (separate cudaMalloc'd buffer for intra-node IPC)
-  void rdep_nvshmem_get_ipc_handle_bf16(void* handle_out);
-  void rdep_nvshmem_open_ipc_handles_bf16(const void* handles, int local_world);
-  void rdep_nvshmem_sync_ipc_buffer_ptrs_bf16();
-  void rdep_nvshmem_get_ipc_handle_blockscaled(void* handle_out);
-  void rdep_nvshmem_open_ipc_handles_blockscaled(const void* handles, int local_world);
-  void rdep_nvshmem_sync_ipc_buffer_ptrs_blockscaled();
-#endif
   void rdep_get_ipc_handle_bf16(void* handle_out);
   void rdep_get_ipc_handle_blockscaled(void* handle_out);
   void rdep_open_ipc_handles_bf16(const void* handles, int world);
@@ -266,6 +247,7 @@ extern "C" {
       float lr, float beta1, float beta2,
       float weight_decay, float eps,
       float step_size, float inv_bias_correction2_sqrt,
+      uint32_t seed, uint32_t step,
       cudaStream_t stream);
 	  cudaError_t build_grouped_gemm_metadata(
 	      const int32_t* offs, int E,
@@ -331,10 +313,7 @@ PYBIND11_MODULE(rdep, m) {
      "Initialize RDEP with rank, world size, and local world size");
 
   m.def("get_mode", &rdep_get_mode,
-        "Get current mode (0=SINGLE, 1=IPC, 2=HYBRID)");
-
-  m.def("has_nvshmem", &rdep_has_nvshmem,
-        "Check if NVSHMEM support is compiled in");
+        "Get current mode (0=SINGLE, 1=IPC)");
 
   m.def("get_ipc_handle_bf16", []() {
     py::array_t<uint8_t> handle(IPC_HANDLE_SIZE);
@@ -938,6 +917,7 @@ PYBIND11_MODULE(rdep, m) {
          float lr, float beta1, float beta2,
          float weight_decay, float eps,
          float step_size, float inv_bias_correction2_sqrt,
+         uint32_t seed, uint32_t step,
          py::object stream) {
         auto err = expert_adamw_step(
             profile,
@@ -953,6 +933,7 @@ PYBIND11_MODULE(rdep, m) {
             lr, beta1, beta2,
             weight_decay, eps,
             step_size, inv_bias_correction2_sqrt,
+            seed, step,
             to_stream(stream));
         if (err != cudaSuccess) throw std::runtime_error("expert_adamw_step failed");
       },
@@ -983,6 +964,8 @@ PYBIND11_MODULE(rdep, m) {
       py::arg("eps"),
       py::arg("step_size"),
       py::arg("inv_bias_correction2_sqrt"),
+      py::arg("seed"),
+      py::arg("step"),
       py::arg("stream") = py::none(),
       "Fused expert AdamW update + packed weight cache emission (FP8/NVFP4)");
 
@@ -1249,73 +1232,5 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("ptrs_abc"), py::arg("ptrs_sfasfb"),
      py::arg("stream") = py::none(),
      "Build grouped GEMM metadata on GPU for strided grouped interface");
-
-#ifdef WITH_NVSHMEM
-  // ========== NVSHMEM Functions ==========
-  m.def("nvshmem_get_uid", []() {
-    int size = rdep_nvshmem_get_uid_size();
-    py::array_t<uint8_t> uid(size);
-    rdep_nvshmem_get_uid(uid.mutable_data());
-    return uid;
-  }, "Get NVSHMEM UID for bootstrap (call on rank 0 only)");
-
-  m.def("nvshmem_get_uid_size", &rdep_nvshmem_get_uid_size,
-        "Get NVSHMEM UID size in bytes");
-
-  m.def("nvshmem_init", [](py::array_t<uint8_t> uid, int rank, int world, int local_world) {
-    rdep_nvshmem_init_with_uid(uid.data(), rank, world, local_world);
-  }, py::arg("uid"), py::arg("rank"), py::arg("world"), py::arg("local_world"),
-     "Initialize NVSHMEM with UID from rank 0");
-
-  m.def("nvshmem_finalize", &rdep_nvshmem_finalize,
-        "Finalize NVSHMEM");
-
-  m.def("nvshmem_alloc_bf16", [](size_t capacity, int H, int n_local) {
-    rdep_nvshmem_alloc_bf16(capacity, H, n_local);
-  }, py::arg("capacity"), py::arg("H"), py::arg("n_local"),
-     "Allocate NVSHMEM symmetric buffers for BF16 path");
-
-  m.def("nvshmem_alloc_blockscaled", [](size_t capacity, int H, int n_local, int profile) {
-    rdep_nvshmem_alloc_blockscaled(capacity, H, n_local, profile);
-  }, py::arg("capacity"), py::arg("H"), py::arg("n_local"), py::arg("profile"),
-     "Allocate NVSHMEM symmetric buffers for blockscaled path");
-
-  m.def("nvshmem_barrier", &rdep_nvshmem_barrier,
-        "NVSHMEM barrier (all PEs)");
-
-  m.def("nvshmem_quiet", &rdep_nvshmem_quiet,
-        "NVSHMEM quiet (ensure all puts complete)");
-
-  // NVSHMEM IPC buffer functions (separate cudaMalloc'd buffer)
-  // These are different from rdep get_ipc_handle_bf16 - they get handles
-  // from the cudaMalloc'd IPC buffer, NOT from NVSHMEM symmetric heap
-  m.def("nvshmem_get_ipc_handle_bf16", []() {
-    py::array_t<uint8_t> handle(IPC_HANDLE_SIZE);
-    rdep_nvshmem_get_ipc_handle_bf16(handle.mutable_data());
-    return handle;
-  }, "Get IPC handle for NVSHMEM's separate IPC buffer (BF16)");
-
-  m.def("nvshmem_open_ipc_handles_bf16", [](py::array_t<uint8_t> handles, int local_world) {
-    rdep_nvshmem_open_ipc_handles_bf16(handles.data(), local_world);
-  }, py::arg("handles"), py::arg("local_world"),
-     "Open remote IPC handles for NVSHMEM's IPC buffer (BF16)");
-
-  m.def("nvshmem_sync_ipc_buffer_ptrs_bf16", &rdep_nvshmem_sync_ipc_buffer_ptrs_bf16,
-        "Sync NVSHMEM IPC buffer pointers to device");
-
-  m.def("nvshmem_get_ipc_handle_blockscaled", []() {
-    py::array_t<uint8_t> handle(IPC_HANDLE_SIZE);
-    rdep_nvshmem_get_ipc_handle_blockscaled(handle.mutable_data());
-    return handle;
-  }, "Get IPC handle for NVSHMEM's separate IPC buffer (blockscaled)");
-
-  m.def("nvshmem_open_ipc_handles_blockscaled", [](py::array_t<uint8_t> handles, int local_world) {
-    rdep_nvshmem_open_ipc_handles_blockscaled(handles.data(), local_world);
-  }, py::arg("handles"), py::arg("local_world"),
-     "Open remote IPC handles for NVSHMEM's IPC buffer (blockscaled)");
-
-  m.def("nvshmem_sync_ipc_buffer_ptrs_blockscaled", &rdep_nvshmem_sync_ipc_buffer_ptrs_blockscaled,
-        "Sync NVSHMEM IPC buffer pointers to device (blockscaled)");
-#endif
 }
 #endif

@@ -1,7 +1,7 @@
 # Makefile for rdep CUDA extension
 #
 # Builds rdep.so for Python import
-# Requires: CUDA 12.x, sm_100a (B200), pybind11
+# Requires: CUDA 12.x, pybind11
 # Optional: NVSHMEM for multi-node support (auto-detected)
 #
 # Usage:
@@ -25,16 +25,34 @@ PYTHON_EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get
 HAS_NVSHMEM := $(shell test -f $(NVSHMEM_INCLUDE)/nvshmem.h && echo 1 || echo 0)
 
 # Compilers
-NVCC := $(CUDA_HOME)/bin/nvcc
-CXX := g++
+# nvcc may be installed outside CUDA_HOME (e.g. apt installs to /usr/bin/nvcc).
+NVCC ?= nvcc
+CXX ?= g++
+
+# Target GPU arch for device code generation.
+# - Primary target: B200 (sm_100a)
+# - Bring-up target: H100 (sm_90) for BF16-only speedruns/research (no NVFP4/MLA).
+NMOE_CUDA_ARCH ?= 100a
+
+ifeq ($(NMOE_CUDA_ARCH),100a)
+    NMOE_NVCC_ARCH_FLAGS := -gencode arch=compute_100a,code=sm_100a
+    NMOE_ENABLE_PTX_E2M1 := 1
+else ifeq ($(NMOE_CUDA_ARCH),90)
+    NMOE_NVCC_ARCH_FLAGS := -gencode arch=compute_90,code=sm_90
+    # NVFP4 (E2M1) is SM100-only. We keep the symbol available for compilation
+    # (shared headers reference it) but it will trap if called on SM90.
+    NMOE_ENABLE_PTX_E2M1 := 1
+else
+    $(error Unsupported NMOE_CUDA_ARCH=$(NMOE_CUDA_ARCH). Supported: 100a (B200), 90 (H100))
+endif
 
 # Base flags
 NVCC_FLAGS := -std=c++17 -O3 \
-    -gencode arch=compute_100a,code=sm_100a \
+    $(NMOE_NVCC_ARCH_FLAGS) \
     -rdc=true \
     -Xcompiler -fPIC \
     --expt-relaxed-constexpr \
-    -DNMOE_ENABLE_PTX_E2M1=1 \
+    -DNMOE_ENABLE_PTX_E2M1=$(NMOE_ENABLE_PTX_E2M1) \
     -I$(CUDA_HOME)/include
 
 CXX_FLAGS := -std=c++17 -O3 -fPIC \
@@ -66,11 +84,19 @@ CUTLASS_INCLUDE ?= $(FLASHMLA_CSRC)/cutlass/include
 CUTLASS_UTIL_INCLUDE ?= $(FLASHMLA_CSRC)/cutlass/tools/util/include
 HAS_FLASHMLA := $(shell test -f $(FLASHMLA_CSRC)/sm100/prefill/dense/interface.h && test -f $(CUTLASS_INCLUDE)/cutlass/cutlass.h && echo 1 || echo 0)
 
-ifeq ($(HAS_FLASHMLA), 1)
-    FLASHMLA_INCLUDE_FLAGS := -I$(FLASHMLA_CSRC) -I$(CUTLASS_INCLUDE) -I$(CUTLASS_UTIL_INCLUDE)
-    FLASHMLA_STATUS := enabled (FLASHMLA_HOME=$(FLASHMLA_HOME))
-else
-    $(error FlashMLA not found. Clone https://github.com/deepseek-ai/FlashMLA into third_party/flashmla (with submodules) or set FLASHMLA_HOME=/path/to/FlashMLA)
+# FlashMLA is SM100-only; skip on H100 builds.
+FLASHMLA_STATUS := disabled (requires NMOE_CUDA_ARCH=100a)
+FLASHMLA_INCLUDE_FLAGS :=
+FLASHMLA_TARGET :=
+
+ifeq ($(NMOE_CUDA_ARCH),100a)
+    ifeq ($(HAS_FLASHMLA), 1)
+        FLASHMLA_INCLUDE_FLAGS := -I$(FLASHMLA_CSRC) -I$(CUTLASS_INCLUDE) -I$(CUTLASS_UTIL_INCLUDE)
+        FLASHMLA_STATUS := enabled (FLASHMLA_HOME=$(FLASHMLA_HOME))
+        FLASHMLA_TARGET := flashmla_sm100$(PYTHON_EXT_SUFFIX)
+    else
+        $(error FlashMLA not found. Clone https://github.com/deepseek-ai/FlashMLA into third_party/flashmla (with submodules) or set FLASHMLA_HOME=/path/to/FlashMLA)
+    endif
 endif
 
 # Targets (.so files stay in csrc/, imported as nmoe.csrc.*)
@@ -80,7 +106,6 @@ GPU_TARGET := gpu$(PYTHON_EXT_SUFFIX)
 # Place muon under opt/ subpackage
 OPT_DIR := opt
 MUON_TARGET := $(OPT_DIR)/muon$(PYTHON_EXT_SUFFIX)
-FLASHMLA_TARGET := flashmla_sm100$(PYTHON_EXT_SUFFIX)
 
 # RDEP sources
 RDEP_CUDA_SRCS := rdep.cu quant.cu ptx.cu adamw.cu gemm.cu $(NVSHMEM_SRCS)
@@ -166,8 +191,9 @@ $(RDEP_TARGET): $(RDEP_CUDA_OBJS) $(DLINK_OBJ) $(RDEP_CPP_OBJS)
 # ========== GPU telemetry module (NVML only, no CUDA) ==========
 
 $(GPU_TARGET): $(GPU_OBJS)
-	$(CXX) -o $@ $^ -shared -lnvidia-ml \
-		-L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64
+	$(CXX) -o $@ $^ -shared \
+		-L/usr/lib/x86_64-linux-gnu -l:libnvidia-ml.so.1 \
+		-Wl,-rpath,/usr/lib/x86_64-linux-gnu
 	@echo ""
 	@echo "Built $(GPU_TARGET)"
 	@echo ""
@@ -187,11 +213,13 @@ $(MUON_TARGET): $(MUON_OBJS) $(MUON_DLINK_OBJ)
 
 # ========== FlashMLA SM100 dense prefill bwd (CUDA) ==========
 
+ifneq ($(FLASHMLA_TARGET),)
 $(FLASHMLA_TARGET): $(FLASHMLA_BWD_OBJ) $(FLASHMLA_CPP_OBJS)
 	$(CXX) -o $@ $^ $(FLASHMLA_LDFLAGS)
 	@echo ""
 	@echo "Built $(FLASHMLA_TARGET)"
 	@echo ""
+endif
 
 # ========== Inference IPC buffer allocator (torch-linked, CUDA) ==========
 

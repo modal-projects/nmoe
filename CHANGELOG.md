@@ -59,19 +59,16 @@ All notable changes to nmoe are documented here.
 ## [2025-12-31] - Issue 02: Data Pipeline
 
 ### Added
-- HYDRA-vNext training specification (L18 probe → L24 judge → distillation)
-- ArXiv processing pipeline (`nmoe/data/arxiv/`): S3 download, HTML/LaTeX parsing, metadata
-- Stack v2 content materialization (`nmoe/data/stack_v2_materialize.py`)
 - Flow profiles and mixture configurations (`configs/flow_profiles.toml`, `configs/tasks.toml`)
 - TOML env var expansion with security guardrails (`nmoe/config.load_toml()`)
-- Data prep CLI enhancements (`nmoe/data/cli.py`)
+- Data prep (HF → shards) utilities and CLI (`nmoe/data/*`)
 
 ### Changed
 - All config paths now use `${NMOE_DATA_PATH:-/data}` pattern (env-driven)
 - `nmoe/data/__init__.py`: lazy import refactor for dependency hygiene
 
 ### Security
-- Env var expansion restricted to `NMOE_*` and `HYDRA_*` prefixes only
+- Env var expansion restricted to `NMOE_*` prefix only
 - Fail-fast on unresolved `${...}` placeholders
 - No internal paths or credentials in tracked configs
 

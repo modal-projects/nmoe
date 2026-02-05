@@ -28,11 +28,3 @@ name = "HumanEval"
 source = "hf:openai/openai_humaneval:test"
 fewshot = 0
 scorer = "unittest"
-
-[[task]]
-name = "HYDRA-KEEP"
-source = "jsonl:/data/eval/hydra_heldout.jsonl"
-fewshot = 0
-scorer = "judge"
-tau_keep = 0.5
-

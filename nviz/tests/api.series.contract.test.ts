@@ -12,31 +12,24 @@ describe('/api/series contract', () => {
     const dir = mkdtempSync(join(os.tmpdir(), 'nviz-metrics-'))
     process.env.NVIZ_METRICS_DIR = dir
     mkdirSync(join(dir, 'runA'), { recursive: true })
-    const dbPath = join(dir, 'runA', 'rank_0.duckdb')
+    const parquetPath = join(dir, 'runA', 'step_00000001.parquet')
 
-    const inst = await DuckDBInstance.create(dbPath)
+    const sqlLit = (s: string) => `'${s.replaceAll("'", "''")}'`
+
+    const inst = await DuckDBInstance.create(':memory:')
     const conn = await inst.connect()
     try {
-      await conn.run(`
-        CREATE TABLE IF NOT EXISTS metrics (
-          run   TEXT NOT NULL,
-          tag   TEXT NOT NULL,
-          step  INTEGER NOT NULL,
-          ts_ms BIGINT NOT NULL,
-          value DOUBLE NOT NULL,
-          PRIMARY KEY (run, tag, step)
-        );
-      `)
       // 10k points fast-path via DuckDB range + scalar math.
       await conn.run(`
-        INSERT OR REPLACE INTO metrics
-        SELECT
-          'runA' AS run,
-          'train/loss' AS tag,
-          i AS step,
-          i AS ts_ms,
-          sin(i::DOUBLE / 50.0) + i::DOUBLE * 1e-3 AS value
-        FROM range(1, 10001) tbl(i)
+        COPY (
+          SELECT
+            'runA' AS run,
+            'train/loss' AS tag,
+            i AS step,
+            i AS ts_ms,
+            sin(i::DOUBLE / 50.0) + i::DOUBLE * 1e-3 AS value
+          FROM range(1, 10001) tbl(i)
+        ) TO ${sqlLit(parquetPath)} (FORMAT PARQUET)
       `)
     } finally {
       try { await conn.close() } catch {}

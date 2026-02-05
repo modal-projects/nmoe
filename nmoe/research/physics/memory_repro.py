@@ -14,7 +14,7 @@ Task
   We train standard next-token prediction and report answer-region accuracy.
 
 Run
-  python -m nmoe.physics.memory_repro --output /tmp/memory_repro --steps 2000
+  python -m nmoe.research.physics.memory_repro --output /tmp/memory_repro --steps 2000
 """
 
 from __future__ import annotations

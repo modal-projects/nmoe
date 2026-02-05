@@ -46,9 +46,19 @@ nviz/.env.local
 AGENTS.md.local
 
 # Internal-only debug/handoff docs (do not publish)
+AI_WORKFLOW.md
+SPEEDRUN*.md
 *_handoff*.md
 HANDOFF.md
 PIPELINE_TEST_RESULTS.md
+
+# Research docs (unpublished research, internal notes)
+docs/
+nmoe/research/physics/HARNESS_VALIDATION.md
+nmoe/research/physics/CANON_REPLICATION_PLAN.md
+
+# Blog (generated / not shipped)
+blog/
 
 # Third-party working trees (not shipped; only patches ship)
 third_party/nvshmem/

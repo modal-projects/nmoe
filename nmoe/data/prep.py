@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import multiprocessing as mp
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -289,115 +290,132 @@ class ParallelPrepPipeline:
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
         log.info(f"Starting parallel preprocessing: {self.source.name} → {cfg.output_dir}")
-        log.info(f"Tokenizer: {cfg.tokenizer}, Workers: {cfg.num_workers}")
+        log.info(
+            f"Tokenizer: {cfg.tokenizer}, Shards: {cfg.num_shards}, Workers: {cfg.num_workers}, Batch: {cfg.batch_size}"
+        )
 
-        # Collect all tokenized documents grouped by shard
-        shard_docs: Dict[int, List[Tuple[str, List[int]]]] = {i: [] for i in range(cfg.num_shards)}
+        # Initialize per-shard writers (lazy)
+        shard_writers: Dict[int, ShardedWriter] = {}
+
+        def get_writer(shard_id: int) -> ShardedWriter:
+            if shard_id not in shard_writers:
+                shard_writers[shard_id] = ShardedWriter(
+                    output_dir=cfg.output_dir / f"shard_{shard_id:04d}",
+                    dataset=cfg.dataset_name,
+                    version=cfg.version,
+                    eos_token_id=cfg.eos_token_id,
+                    vocab_size=cfg.vocab_size,
+                    tokenizer=cfg.tokenizer,
+                    dtype=cfg.dtype,
+                    tokens_per_shard=cfg.tokens_per_shard,
+                    source_info={"source": self.source.name},
+                )
+            return shard_writers[shard_id]
 
         docs_processed = 0
         tokens_processed = 0
+        reached_limit = False
 
-        # Use ProcessPoolExecutor for CPU-bound tokenization
+        def process_results(results: List[Tuple[str, List[int]]]) -> bool:
+            nonlocal docs_processed, tokens_processed
+            for doc_id, tokens in results:
+                shard_id = _get_shard_id(doc_id, cfg.num_shards)
+                get_writer(shard_id).add_document(tokens)
+                docs_processed += 1
+                tokens_processed += len(tokens) + 1  # +1 for EOS
+                if cfg.max_tokens_total and tokens_processed >= cfg.max_tokens_total:
+                    return True
+            return False
+
+        # Use ProcessPoolExecutor for CPU-bound tokenization. Keep a small bounded
+        # number of in-flight batches so we don't enumerate the whole dataset.
+        max_inflight_batches = max(1, cfg.num_workers * 2)
+        inflight: deque = deque()
+
         with ProcessPoolExecutor(max_workers=cfg.num_workers) as executor:
-            batch: List[Document] = []
-
-            def submit_batch(batch: List[Document]):
+            def submit_batch(docs: List[Document]):
                 return executor.submit(
                     _tokenize_batch,
-                    batch,
+                    docs,
                     cfg.tokenizer,
                     cfg.min_tokens,
                     cfg.max_tokens,
                 )
 
-            futures = []
+            batch: List[Document] = []
+
             for doc in self.source:
+                if reached_limit:
+                    break
                 batch.append(doc)
                 if len(batch) >= cfg.batch_size:
-                    futures.append(submit_batch(batch))
+                    inflight.append(submit_batch(batch))
                     batch = []
 
-            if batch:
-                futures.append(submit_batch(batch))
+                while inflight and len(inflight) >= max_inflight_batches:
+                    results = inflight.popleft().result()
+                    reached_limit = process_results(results) or reached_limit
+                    if progress_callback:
+                        progress_callback(docs_processed, tokens_processed)
+                    if reached_limit:
+                        break
 
-            # Collect results
-            for future in futures:
-                results = future.result()
-                for doc_id, tokens in results:
-                    shard_id = _get_shard_id(doc_id, cfg.num_shards)
-                    shard_docs[shard_id].append((doc_id, tokens))
-                    tokens_processed += len(tokens)
-                docs_processed += len(results)
+            if batch and not reached_limit:
+                inflight.append(submit_batch(batch))
 
+            while inflight and not reached_limit:
+                results = inflight.popleft().result()
+                reached_limit = process_results(results) or reached_limit
                 if progress_callback:
                     progress_callback(docs_processed, tokens_processed)
 
-        log.info(f"Tokenized {docs_processed:,} documents, {tokens_processed:,} tokens")
+        if reached_limit:
+            log.info(f"Reached token limit ({cfg.max_tokens_total:,}), stopping early")
 
-        # Write shards (could parallelize this too)
-        all_shard_infos = []
-        for shard_id, docs in shard_docs.items():
-            if not docs:
-                continue
+        log.info(f"Processed {docs_processed:,} documents, {tokens_processed:,} tokens")
 
-            shard_dir = cfg.output_dir / f"shard_{shard_id:04d}"
-            with ShardedWriter(
-                output_dir=shard_dir,
-                dataset=cfg.dataset_name,
-                version=cfg.version,
-                eos_token_id=cfg.eos_token_id,
-                vocab_size=cfg.vocab_size,
-                tokenizer=cfg.tokenizer,
-                dtype=cfg.dtype,
-                tokens_per_shard=cfg.tokens_per_shard,
-            ) as writer:
-                for doc_id, tokens in docs:
-                    writer.add_document(tokens)
-
-        # Create combined manifest
-        import json
-        from datetime import datetime
-
-        # Re-read all shard manifests
+        # Finalize all shard writers and collect shards with correct paths
+        all_shards = []
         total_tokens = 0
         total_docs = 0
-        all_shards = []
-        for shard_dir in sorted(cfg.output_dir.glob("shard_*")):
-            manifest_file = shard_dir / "manifest.json"
-            if not manifest_file.exists():
-                continue
-            with open(manifest_file) as f:
-                m = json.load(f)
-            total_tokens += m["total_tokens"]
-            total_docs += m["total_documents"]
-            for s in m["shards"]:
-                s["path"] = f"{shard_dir.name}/{s['path']}"
-                s["index_path"] = f"{shard_dir.name}/{s['index_path']}"
+        created_at = ""
+        for shard_id in sorted(shard_writers.keys()):
+            manifest = shard_writers[shard_id].finalize()
+            if not created_at:
+                created_at = manifest.created_at
+            total_tokens += manifest.total_tokens
+            total_docs += manifest.total_documents
+            shard_dir = f"shard_{shard_id:04d}"
+            for s in manifest.shards:
+                s.path = f"{shard_dir}/{s.path}"
+                s.index_path = f"{shard_dir}/{s.index_path}"
                 all_shards.append(s)
 
-        combined_manifest = {
-            "dataset": cfg.dataset_name,
-            "version": cfg.version,
-            "tokenizer": cfg.tokenizer,
-            "vocab_size": cfg.vocab_size,
-            "eos_token_id": cfg.eos_token_id,
-            "dtype": str(np.dtype(cfg.dtype)),
-            "created_at": datetime.utcnow().isoformat() + "Z",
-            "total_tokens": total_tokens,
-            "total_documents": total_docs,
-            "num_shards": len(all_shards),
-            "shards": all_shards,
-            "source_info": {"source": self.source.name},
-        }
+        combined_manifest = ManifestInfo(
+            dataset=cfg.dataset_name,
+            version=cfg.version,
+            tokenizer=cfg.tokenizer,
+            vocab_size=cfg.vocab_size,
+            eos_token_id=cfg.eos_token_id,
+            dtype=str(np.dtype(cfg.dtype)),
+            created_at=created_at,
+            total_tokens=total_tokens,
+            total_documents=total_docs,
+            num_shards=len(all_shards),
+            shards=all_shards,
+            source_info={"source": self.source.name, "num_shard_dirs": len(shard_writers)},
+        )
 
+        # Write combined manifest
+        import json
         manifest_path = cfg.output_dir / "manifest.json"
         tmp_path = manifest_path.with_name(manifest_path.name + ".tmp")
         with open(tmp_path, "w") as f:
-            json.dump(combined_manifest, f, indent=2)
+            json.dump(combined_manifest.to_dict(), f, indent=2)
         tmp_path.replace(manifest_path)
 
         log.info(f"Wrote manifest: {manifest_path}")
-        return ManifestInfo.from_dict(combined_manifest)
+        return combined_manifest
 
 
 # =============================================================================
