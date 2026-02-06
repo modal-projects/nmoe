@@ -68,7 +68,7 @@ For wide-ranging changes (new public APIs, multi-file refactors, kernel/distribu
 3. **Explicit over magical**: No hidden background machinery or side effects; contracts and control flow are obvious.
 4. **Hot paths first**: Inner loops and comm paths are lean, predictable, and measured. If it doesn't move tokens/s, stability, or correctness, it doesn't live there.
 5. **Fail fast, fail loud**: Specific guardrails with actionable remedies. No silent downshifts.
-6. **Minimal dependencies**: PyTorch + CuTeDSL + NVSHMEM. New layers must improve both clarity and performance.
+6. **Minimal dependencies**: PyTorch + CuTeDSL. New layers must improve both clarity and performance.
 7. **One source of truth**: One config format, one checkpoint format, one metrics schema. No duplicates to drift.
 8. **Test what matters**: Deterministic resume, conservation, invariants. No scaffolding that mirrors system complexity.
 9. **Container-first reproducibility**: Controlled build/runtime; off-target paths are explicit and opt-in.
@@ -128,8 +128,8 @@ For any change, ask:
 
 ## Metrics/Tracking
 - SQLite for experiments (`/data/experiments.db`)
-- DuckDB for metrics (`/data/metrics/{run_id}/rank_{rank}.duckdb`)
-- NVIZ reads from shared storage
+- Parquet for metrics (`/data/metrics/{run_id}/step_*.parquet`)
+- NVIZ reads from shared storage via DuckDB
 
 ---
 

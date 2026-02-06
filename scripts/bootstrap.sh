@@ -356,12 +356,31 @@ fi
 # -----------------------------------------------------------------------------
 # 11. Create data directory
 # -----------------------------------------------------------------------------
-echo "[11/11] Setting up data directory..."
+echo "[11/12] Setting up data directory..."
 
 sudo mkdir -p /data
 DATA_OWNER="${SUDO_USER:-${USER:-$(id -un)}}"
 sudo chown "${DATA_OWNER}:${DATA_OWNER}" /data
 echo "Data directory ready: /data"
+
+# -----------------------------------------------------------------------------
+# 12. Download CORE eval bundle
+# -----------------------------------------------------------------------------
+echo "[12/12] Downloading CORE eval bundle..."
+
+EVAL_BUNDLE_URL="https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
+EVAL_BUNDLE_DIR="/data/eval/eval_bundle"
+
+if [ ! -d "$EVAL_BUNDLE_DIR" ] || [ -z "$(ls -A $EVAL_BUNDLE_DIR 2>/dev/null)" ]; then
+    mkdir -p "$(dirname $EVAL_BUNDLE_DIR)"
+    echo "Downloading from $EVAL_BUNDLE_URL..."
+    curl -L -o /tmp/eval_bundle.zip "$EVAL_BUNDLE_URL"
+    unzip -q /tmp/eval_bundle.zip -d "$(dirname $EVAL_BUNDLE_DIR)"
+    rm /tmp/eval_bundle.zip
+    echo "CORE eval bundle installed: $EVAL_BUNDLE_DIR"
+else
+    echo "CORE eval bundle already exists: $EVAL_BUNDLE_DIR"
+fi
 
 # -----------------------------------------------------------------------------
 # Done

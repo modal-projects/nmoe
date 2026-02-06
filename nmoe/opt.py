@@ -13,7 +13,6 @@ import torch.distributed as dist
 
 from nmoe.config import Config
 from nmoe import zero2
-from nmoe.ks2d import KS2D
 
 # Lazy import for normuon CUDA kernel
 _muon_ext = None
@@ -151,22 +150,30 @@ class NorMuon(torch.optim.Optimizer):
 class ExpertMuon(torch.optim.Optimizer):
   """Muon-style optimizer for MoE expert weights ([E, M, N] tensors).
 
-  This matches the NorMuon recipe but applies polar retraction per expert matrix
-  in a single batched kernel call.
+  Moonlight recipe (Muon is Scalable for LLM Training, arXiv:2502.16982):
+  - SGD-Nesterov momentum base
+  - Polar Express orthogonalization (Newton-Schulz, 5 steps)
+  - Per-matrix update scaling: 0.2 * sqrt(max(M, N)) (consistent update RMS)
+  - Standard decoupled weight decay (AdamW-style)
+
+  Note: This optimizer is for expert matrices only. Non-matrix params remain on AdamW.
   """
 
   emits_weight_cache = False
 
-  def __init__(self, params, lr=3.4e-4, momentum=0.95, beta2=0.95, weight_decay=1.2):
-    defaults = dict(lr=lr, momentum=momentum, beta2=beta2, weight_decay=weight_decay)
+  def __init__(self, params, lr=3.4e-4, momentum=0.95, weight_decay=0.1, *, update_rms: float = 0.2):
+    defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, update_rms=update_rms)
     super().__init__(params, defaults)
-    self._plan_cache = {}  # Cache muon plans by (Bmax, M, N) shape
+    # Cache muon plans by (M, N). Plan workspace scales with Bmax (tile batch),
+    # so we keep Bmax modest and rely on internal tiling in muon_plan_run for
+    # large expert counts (e.g., E=4096).
+    self._plan_cache = {}
 
-  def _get_plan(self, B: int, M: int, N: int):
-    key = (B, M, N)
+  def _get_plan(self, M: int, N: int, *, Bmax: int = 32):
+    key = (M, N)
     if key not in self._plan_cache:
       ext = _get_muon_ext()
-      self._plan_cache[key] = ext.plan_create(B, M, N)
+      self._plan_cache[key] = ext.plan_create(int(Bmax), int(M), int(N))
     return self._plan_cache[key]
 
   def __del__(self):
@@ -187,8 +194,8 @@ class ExpertMuon(torch.optim.Optimizer):
     for group in self.param_groups:
       lr = float(group['lr'])
       momentum = float(group['momentum'])
-      beta2 = float(group['beta2'])
       wd = float(group['weight_decay'])
+      update_rms = float(group.get('update_rms', 0.2))
 
       for p in group['params']:
         if p.grad is None:
@@ -210,40 +217,26 @@ class ExpertMuon(torch.optim.Optimizer):
 
         if len(state) == 0:
           state['momentum_buffer'] = torch.zeros_like(grad)
-          # Variance buffer along smaller dimension (Adafactor-style), per expert.
-          if M >= N:
-            state['variance_buffer'] = torch.zeros(E, M, 1, device=grad.device, dtype=torch.float32)
-          else:
-            state['variance_buffer'] = torch.zeros(E, 1, N, device=grad.device, dtype=torch.float32)
 
         mom_buf = state['momentum_buffer']
-        var_buf = state['variance_buffer']
 
         # 1) Momentum update
         mom_buf.lerp_(grad, 1 - momentum)
         update = grad.lerp(mom_buf, momentum).contiguous()
 
         # 2) Polar Express orthogonalization (batched over experts)
-        plan = self._get_plan(int(E), int(M), int(N))
+        plan = self._get_plan(int(M), int(N))
         ext.plan_run(plan, update.data_ptr(), int(E), int(M), int(N))
 
-        # 3) Variance reduction (Adafactor-style), matching NorMuon.
-        red_dim = -1 if M >= N else -2
-        v_mean = update.float().square().mean(dim=red_dim, keepdim=True)
-        red_dim_size = int(update.size(red_dim))
-        v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
-        v_norm = v_norm_sq.sqrt_()
-        var_buf.lerp_(v_mean.to(dtype=var_buf.dtype), 1 - beta2)
-        step_size = var_buf.clamp_min(1e-10).rsqrt_()
-        scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-        v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
-        final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
-        update.mul_(final_scale.type_as(update))
+        # 3) Moonlight scaling: update RMS ~ update_rms (default 0.2), independent of shape.
+        # Muon update RMS is ~ sqrt(1 / max(M, N)) for full-rank matrices.
+        if update_rms != 1.0:
+          update.mul_(update_rms)
+        update.mul_(math.sqrt(float(max(M, N))))
 
-        # 4) Cautious weight decay (Muon).
-        if wd > 0:
-          mask = (update * p) >= 0
-          p.sub_(p * mask, alpha=float(wd) * float(lr) * float(lr))
+        # 4) Standard decoupled weight decay (AdamW-style).
+        if wd > 0.0:
+          p.mul_(1.0 - float(lr) * float(wd))
 
         # 5) Apply update
         p.sub_(update, alpha=float(lr))
@@ -514,35 +507,11 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
         expert_params,
         lr=float(cfg.lr_expert),
         momentum=float(getattr(cfg, "muon_momentum", 0.95)),
-        beta2=float(getattr(cfg, "adam_beta2_expert", 0.95)),
-        weight_decay=float(getattr(cfg, "muon_weight_decay", 1.2)),
-      )
-    elif expert_opt == "ks2d":
-      warmup = getattr(cfg, "ks2d_warmup_steps", None)
-      warmup_steps = int(cfg.warmup_steps) if warmup is None else int(warmup)
-      rank = int(getattr(cfg, "ks2d_rank", 8))
-      cb_freq = int(getattr(cfg, "ks2d_codebook_update_freq", 100))
-      max_rms = float(getattr(cfg, "ks2d_max_update_rms", 1.0))
-
-      groups: dict[str, list[torch.nn.Parameter]] = {}
-      for name, p in expert_named_params:
-        leaf = name.rsplit(".", 1)[-1]
-        role = f"expert_{leaf.lower()}" if leaf in ("W1", "W2", "W3") else "expert"
-        groups.setdefault(role, []).append(p)
-      param_groups = [{"ks2d_role": r, "params": ps} for r, ps in sorted(groups.items())]
-      expert_optimizer = KS2D(
-        param_groups,
-        lr=float(cfg.lr_expert),
-        momentum=float(cfg.adam_beta1),
-        beta2=float(cfg.adam_beta2_expert),
-        weight_decay=float(cfg.weight_decay),
-        rank=rank,
-        codebook_update_freq=cb_freq,
-        warmup_steps=warmup_steps,
-        max_update_rms=max_rms,
+        weight_decay=float(getattr(cfg, "weight_decay", 0.1)),
+        update_rms=float(getattr(cfg, "muon_update_rms", 0.2)),
       )
     else:
-      raise ValueError(f"Unknown expert_opt={expert_opt!r} (expected: auto|adamw|muon|ks2d)")
+      raise ValueError(f"Unknown expert_opt={expert_opt!r} (expected: auto|adamw|muon)")
 
   return expert_optimizer, muon_optimizer, dense_groups
 

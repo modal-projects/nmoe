@@ -116,7 +116,7 @@ See `nmoe/data/README.md` for the data contract and golden-path commands.
 
 Training writes:
 - Experiments → SQLite (`/data/experiments.db`)
-- Metrics → DuckDB (`/data/metrics/{run_id}/rank_{rank}.duckdb`)
+- Metrics → Parquet per step (`/data/metrics/{run_id}/step_*.parquet`)
 
 NVIZ is the included dashboard. See `nviz/README.md`.
 

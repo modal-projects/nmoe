@@ -109,34 +109,20 @@ def _has_npy_shards(dir_path: Path) -> bool:
 
 
 def ensure_eval_bundle() -> Path:
-  """Ensure CORE eval bundle exists. Downloads if missing.
+  """Ensure CORE eval bundle exists. Fails if missing (should be installed by bootstrap.sh).
 
   Returns path to eval_bundle directory.
   """
   bundle_dir = DATA_DIR / "eval" / "eval_bundle"
-  bundle_zip = DATA_DIR / "eval" / "eval_bundle.zip"
 
   if bundle_dir.exists() and any(bundle_dir.rglob("*.jsonl")):
     return bundle_dir
 
-  bundle_dir.parent.mkdir(parents=True, exist_ok=True)
-
-  if not bundle_zip.exists():
-    console.print(f"[yellow]Downloading eval bundle...[/yellow]")
-    # Download from HuggingFace or other source
-    run([
-      "python", "-c",
-      f"from huggingface_hub import hf_hub_download; "
-      f"hf_hub_download('noumena/eval_bundle', 'eval_bundle.zip', local_dir='{bundle_zip.parent}')"
-    ])
-
-  if bundle_zip.exists() and not bundle_dir.exists():
-    console.print(f"[yellow]Extracting eval bundle...[/yellow]")
-    import zipfile
-    with zipfile.ZipFile(bundle_zip, 'r') as z:
-      z.extractall(bundle_dir.parent)
-
-  return bundle_dir
+  console.print(f"[red]CORE eval bundle not found at {bundle_dir}[/red]")
+  console.print("[yellow]Run 'bash scripts/bootstrap.sh' to install it, or download manually:[/yellow]")
+  console.print("  curl -L -o /tmp/eval_bundle.zip https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip")
+  console.print(f"  unzip /tmp/eval_bundle.zip -d {bundle_dir.parent}")
+  raise typer.Exit(1)
 
 
 def ensure_speedrun_data() -> Path:

@@ -14,10 +14,10 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ## Configuration
 
-Training writes timeseries metrics to DuckDB files:
-- `/data/metrics/{run_id}/rank_{rank}.duckdb`
+Training writes timeseries metrics to Parquet files:
+- `/data/metrics/{run_id}/step_*.parquet`
 
-NVIZ reads metrics by attaching all per-rank DuckDB files for a run (read-only).
+NVIZ reads metrics via DuckDB's `read_parquet()` (read-only).
 Point NVIZ at the parent metrics directory:
 ```bash
 export NVIZ_METRICS_DIR=/data/metrics
@@ -26,7 +26,7 @@ export NVIZ_METRICS_DIR=/data/metrics
 ## Features
 
 - **Run Comparison**: Compare loss curves and throughput across runs
-- **Real-time Updates**: SQLite WAL mode enables live metric streaming
+- **Real-time Updates**: Parquet-per-step enables live metric streaming
 - **Experiment Tracking**: Filter by config hash, preset, dtype
 - **GPU Telemetry**: Memory usage, utilization (when NVML available)
 

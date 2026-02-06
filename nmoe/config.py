@@ -104,6 +104,7 @@ class Config:
   lr_muon: float = 0.023  # Muon learning rate (matches modded-nanogpt)
   muon_momentum: float = 0.95
   muon_weight_decay: float = 1.2  # Higher WD for Muon (matches modded-nanogpt)
+  muon_update_rms: float = 0.2  # Moonlight-style consistent update RMS scaling for Muon.
 
   # Expert optimizer override:
   # - "" / None: auto (ExpertAdamW for fp8/nvfp4, AdamW for bf16)

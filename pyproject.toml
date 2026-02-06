@@ -23,8 +23,6 @@ dependencies = [
   "datasets",
   "typer",
   "rich",
-  "jupyter",
-  "notebook",
 ]
 
 [project.scripts]
@@ -36,6 +34,8 @@ research = [
   "pandas",
   "seaborn",
   "tqdm",
+  "jupyter",
+  "notebook",
   "rose-pine-jupyterlab",
 ]
 

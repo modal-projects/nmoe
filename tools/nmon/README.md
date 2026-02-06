@@ -6,29 +6,17 @@ Design goals:
 - Single-run-first (fast follow: multi-run compare).
 - Rendering via `lipgloss` widgets (nvitop-style tables + compact charts).
 - Reads the existing NMoE metrics/artifacts:
-  - DuckDB: `/data/metrics/{run_id}/rank_0.duckdb` (rank-0-only for v1)
+  - Parquet: `/data/metrics/{run_id}/step_*.parquet`
   - SQLite: `/data/experiments.db` (read-only snapshot)
 
-## Run (container-first)
+## Build
 
 ```bash
-cd /workspace/nmoe
-
-docker build -f docker/Dockerfile.nmon -t nmon:dev .
-
-# Default: read from cluster PVC via k8s exec
-docker run --rm -it --net=host \
-  -v ~/.kube:/root/.kube:ro \
-  -e KUBECONFIG=/root/.kube/config \
-  nmon:dev
-
-# Local data (if /data is mounted locally)
-docker run --rm -it \
-  -v /data:/data:ro \
-  nmon:dev --k8s=false
+cd tools/nmon
+go build -o nmon ./cmd/nmon
 ```
 
-## Run (opt-in local)
+## Run (local)
 
 ```bash
 cd /workspace/nmoe/tools/nmon
