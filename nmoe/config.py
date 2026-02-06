@@ -110,14 +110,7 @@ class Config:
   # - "" / None: auto (ExpertAdamW for fp8/nvfp4, AdamW for bf16)
   # - "adamw": always use torch.optim.AdamW for experts (even for fp8/nvfp4; requires post-step cache refresh)
   # - "muon": Muon-style expert optimizer (polar retraction per expert matrix)
-  # - "ks2d": KS2D (compressed PSGD + polar retraction + post-adaptivity) for expert matrices
   expert_opt: Optional[str] = None
-
-  # KS2D (expert optimizer) hyperparams.
-  ks2d_rank: int = 8
-  ks2d_codebook_update_freq: int = 100
-  ks2d_warmup_steps: Optional[int] = None  # If None, defaults to cfg.warmup_steps
-  ks2d_max_update_rms: float = 1.0
 
   # =============================================================================
   # Scheduler (WSD - Warmup-Sustain-Decay)
