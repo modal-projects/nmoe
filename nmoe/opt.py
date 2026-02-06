@@ -1,9 +1,9 @@
 """Optimizer construction, LR scheduling, and training step for MoE.
 
 Three optimizer types:
-- NorMuon: 2D weight matrices (attention, MLP) - Polar Express orthogonalization
+- Muon: 2D weight matrices (attention, MLP) - Polar Express orthogonalization
 - AdamW: embeddings, norms, biases, router - standard AdamW
-- ExpertAdamW: MoE expert MLPs (sharded via RDEP, fused with quantization)
+- ExpertAdamW / ExpertMuon: MoE expert MLPs (sharded via RDEP)
 
 Precision support: bf16, fp8, nvfp4 (default: nvfp4)
 """
@@ -14,7 +14,7 @@ import torch.distributed as dist
 from nmoe.config import Config
 from nmoe import zero2
 
-# Lazy import for normuon CUDA kernel
+# Lazy import for Muon CUDA kernel (Newton-Schulz orthogonalization)
 _muon_ext = None
 def _get_muon_ext():
   global _muon_ext
@@ -32,21 +32,21 @@ def _get_rdep_ext():
   return _rdep_ext
 
 
-class NorMuon(torch.optim.Optimizer):
-  """NorMuon optimizer for 2D weight matrices.
+class Muon(torch.optim.Optimizer):
+  """Muon optimizer for 2D weight matrices.
 
-  Matches modded-nanogpt's NorMuon:
-  - Momentum SGD base
-  - Polar Express orthogonalization (5 iterations)
-  - Low-rank variance reduction (Adafactor-style)
-  - Cautious weight decay
+  Moonlight recipe (Muon is Scalable for LLM Training, arXiv:2502.16982):
+  - SGD-Nesterov momentum base
+  - Polar Express orthogonalization (Newton-Schulz, 5 steps)
+  - Per-matrix update scaling: 0.2 * sqrt(max(M, N)) (consistent update RMS)
+  - Standard decoupled weight decay (AdamW-style)
 
   Only use for 2D weight tensors (attention projections, MLP weights).
   Do NOT use for embeddings, norms, biases, or 1D params.
   """
 
-  def __init__(self, params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2):
-    defaults = dict(lr=lr, momentum=momentum, beta2=beta2, weight_decay=weight_decay)
+  def __init__(self, params, lr=3.4e-4, momentum=0.95, weight_decay=0.1, *, update_rms: float = 0.2):
+    defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, update_rms=update_rms)
     super().__init__(params, defaults)
     self._plan_cache = {}  # Cache muon plans by (M, N) shape
 
@@ -71,15 +71,15 @@ class NorMuon(torch.optim.Optimizer):
   def step(self, closure=None):
     """Perform a single optimization step."""
     if closure is not None:
-      raise RuntimeError("NorMuon does not support closure")
+      raise RuntimeError("Muon does not support closure")
 
     ext = _get_muon_ext()
 
     for group in self.param_groups:
       lr = group['lr']
       momentum = group['momentum']
-      beta2 = group['beta2']
       wd = group['weight_decay']
+      update_rms = float(group.get('update_rms', 0.2))
 
       for p in group['params']:
         if p.grad is None:
@@ -87,63 +87,43 @@ class NorMuon(torch.optim.Optimizer):
 
         grad = p.grad
         if grad.dim() != 2:
-          raise RuntimeError(f"NorMuon only supports 2D tensors, got {grad.dim()}D")
+          raise RuntimeError(f"Muon only supports 2D tensors, got {grad.dim()}D")
+        if not (p.is_cuda and grad.is_cuda):
+          raise RuntimeError("Muon requires CUDA tensors")
+        if grad.dtype != torch.bfloat16:
+          raise RuntimeError("Muon requires BF16 grads")
+        if not (p.is_contiguous() and grad.is_contiguous()):
+          raise RuntimeError("Muon requires contiguous tensors")
 
         state = self.state[p]
 
         # Initialize state
         if len(state) == 0:
           state['momentum_buffer'] = torch.zeros_like(grad)
-          # Variance buffer along smaller dimension (like Adafactor)
-          if grad.size(0) >= grad.size(1):
-            state['variance_buffer'] = torch.zeros(grad.size(0), 1, device=grad.device, dtype=torch.float32)
-          else:
-            state['variance_buffer'] = torch.zeros(1, grad.size(1), device=grad.device, dtype=torch.float32)
 
         mom_buf = state['momentum_buffer']
-        var_buf = state['variance_buffer']
 
-        # 1. Momentum update
+        # 1) Momentum update
         mom_buf.lerp_(grad, 1 - momentum)
-        update = grad.lerp(mom_buf, momentum)
+        update = grad.lerp(mom_buf, momentum).contiguous()
 
-        # 2. Polar Express orthogonalization
-        # Reshape to (1, M, N) for batched API
+        # 2) Polar Express orthogonalization
         M, N = update.shape
-        update_3d = update.unsqueeze(0).contiguous()
+        plan = self._get_plan(int(M), int(N))
+        ext.plan_run(plan, update.data_ptr(), 1, int(M), int(N))
 
-        # Need BF16 for normuon kernel
-        if update_3d.dtype != torch.bfloat16:
-          update_3d = update_3d.bfloat16()
+        # 3) Moonlight scaling: update RMS ~ update_rms (default 0.2), independent of shape.
+        if update_rms != 1.0:
+          update.mul_(update_rms)
+        update.mul_(math.sqrt(float(max(M, N))))
 
-        plan = self._get_plan(M, N)
-        ext.plan_run(plan, update_3d.data_ptr(), 1, M, N)
+        # 4) Standard decoupled weight decay (AdamW-style).
+        if wd > 0.0:
+          p.mul_(1.0 - float(lr) * float(wd))
 
-        update = update_3d.squeeze(0)
+        # 5) Apply update
         if p.dtype != update.dtype:
           update = update.to(p.dtype)
-
-        # 3. Variance reduction (Adafactor-style), matching modded-nanogpt.
-        # This stabilizes Muon scaling (e.g., batch-scaled LR) by normalizing the update.
-        red_dim = -1 if grad.size(0) >= grad.size(1) else -2
-        v_mean = update.float().square().mean(dim=red_dim, keepdim=True)
-        red_dim_size = update.size(red_dim)
-        v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
-        v_norm = v_norm_sq.sqrt_()
-        var_buf.lerp_(v_mean.to(dtype=var_buf.dtype), 1 - beta2)
-        step_size = var_buf.clamp_min(1e-10).rsqrt_()
-        scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-        v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
-        final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
-        update.mul_(final_scale.type_as(update))
-
-        # 4. Cautious weight decay (Muon): only decay where update and param agree in sign.
-        # modded-nanogpt scales this term like wd * lr^2 (wd tensor already includes lr).
-        if wd > 0:
-          mask = (update * p) >= 0
-          p.sub_(p * mask, alpha=float(wd) * float(lr) * float(lr))
-
-        # 5. Apply update
         p.sub_(update, alpha=float(lr))
 
 
@@ -376,12 +356,12 @@ class ExpertAdamW(torch.optim.Optimizer):
 
 
 def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Optimizer | None, torch.optim.Optimizer | None, list[dict]]:
-  """Build optimizers: NorMuon for 2D weights, AdamW for rest, ExpertAdamW for MoE.
+  """Build optimizers: Muon for 2D weights, AdamW for rest, ExpertAdamW/Muon for experts.
 
-  Hybrid optimizer strategy (matches modded-nanogpt):
-  - NorMuon: 2D weight matrices (attention, MLP) - lr=0.023, wd=1.2
-  - AdamW: embeddings, norms, biases, router - lr=0.008, wd=0.005
-  - ExpertAdamW: MoE expert weights (with quantization cache)
+  Hybrid optimizer strategy:
+  - Muon: 2D weight matrices (attention, MLP) - Moonlight recipe
+  - AdamW: embeddings, norms, biases, router
+  - ExpertAdamW / ExpertMuon: MoE expert weights (with quantization cache)
 
   Returns:
     (expert_optimizer, muon_optimizer, dense_groups):
@@ -397,7 +377,7 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
   # Collect parameters by type
   expert_named_params: list[tuple[str, torch.nn.Parameter]] = []
   router_params: list[torch.nn.Parameter] = []
-  muon_params: list[torch.nn.Parameter] = []  # 2D weights for NorMuon
+  muon_params: list[torch.nn.Parameter] = []  # 2D weights for Muon
   dense_params_decay: list[torch.nn.Parameter] = []
   dense_params_no_decay: list[torch.nn.Parameter] = []
 
@@ -419,7 +399,7 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
       router_params.append(param)
       continue
 
-    # Check if this is a 2D weight eligible for NorMuon
+    # Check if this is a 2D weight eligible for Muon
     is_2d_weight = param.dim() == 2 and param.numel() > 1024
     is_adam_only = (
       name.endswith('.bias') or
@@ -460,15 +440,15 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
       'weight_decay': 0.0,
     })
 
-  # NorMuon optimizer for 2D weights
+  # Muon optimizer for 2D weights
   muon_optimizer: torch.optim.Optimizer | None = None
   if use_muon and muon_params:
-    muon_optimizer = NorMuon(
+    muon_optimizer = Muon(
       muon_params,
       lr=muon_lr,
       momentum=muon_momentum,
-      beta2=0.95,
-      weight_decay=muon_wd,
+      weight_decay=float(muon_wd),
+      update_rms=float(getattr(cfg, "muon_update_rms", 0.2)),
     )
 
   # Expert optimizer (MoE only)
@@ -567,7 +547,7 @@ def update_lr(optimizer: torch.optim.Optimizer | None, muon_optimizer: torch.opt
     for g in optimizer.param_groups:
       g['lr'] = lr_expert
 
-  # NorMuon uses its own LR schedule (same shape, different peak)
+  # Muon uses its own LR schedule (same shape, different peak)
   if muon_optimizer is not None:
     peak_muon = float(getattr(cfg, "lr_muon", 0.023))
     floor_muon = min(floor, peak_muon)
@@ -587,11 +567,11 @@ def update_lr(optimizer: torch.optim.Optimizer | None, muon_optimizer: torch.opt
 
 
 def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None, muon_optimizer: torch.optim.Optimizer | None, dense_groups: list[dict], zero2_state: dict, cfg: Config, world: int) -> None:
-  """Optimizer step with ZeRO-2, NorMuon, and post-step hooks.
+  """Optimizer step with ZeRO-2, Muon, and post-step hooks.
 
   Handles:
   - ZeRO-2 AdamW stepping for dense params (if world > 1)
-  - NorMuon stepping for 2D weights (attention, MLP)
+  - Muon stepping for 2D weights (attention, MLP)
   - ExpertAdamW stepping for MoE expert params
   - Post-step model updates (quantization rebuild, router bias)
   """
@@ -607,7 +587,7 @@ def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None, muon_o
   else:
     zero2.step_dense_adamw(dense_groups, state=zero2_state)
 
-  # NorMuon step for 2D weight matrices
+  # Muon step for 2D weight matrices
   if muon_optimizer is not None:
     muon_optimizer.step()
 

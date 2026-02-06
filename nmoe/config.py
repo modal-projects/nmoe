@@ -99,11 +99,11 @@ class Config:
   adam_beta2_expert: float = 0.99  # Higher for FP8 gradient noise
   adam_eps: float = 1e-8
 
-  # NorMuon optimizer (for 2D weight matrices)
-  use_muon: bool = False  # Enable NorMuon for attention/MLP weights
-  lr_muon: float = 0.023  # Muon learning rate (matches modded-nanogpt)
+  # Muon optimizer (for 2D weight matrices)
+  use_muon: bool = False  # Enable Muon for attention/MLP weights
+  lr_muon: float = 3.4e-4  # Muon learning rate (Moonlight: reuse AdamW LR with consistent update RMS)
   muon_momentum: float = 0.95
-  muon_weight_decay: float = 1.2  # Higher WD for Muon (matches modded-nanogpt)
+  muon_weight_decay: float = 0.1  # Muon weight decay (Moonlight: reuse AdamW WD)
   muon_update_rms: float = 0.2  # Moonlight-style consistent update RMS scaling for Muon.
 
   # Expert optimizer override:

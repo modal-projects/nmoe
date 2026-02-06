@@ -63,7 +63,7 @@ def main() -> None:
   ap.add_argument("--target-dn", default="8,12", help="comma list of tokens/param ratios to try")
   ap.add_argument("--warmup-ratio", default=0.0, type=float)
   ap.add_argument("--warmdown-ratio", default=0.4, type=float)
-  ap.add_argument("--use-muon", action="store_true", help="enable NorMuon for 2D weights")
+  ap.add_argument("--use-muon", action="store_true", help="enable Muon for 2D weights")
   ap.add_argument("--out-dir", default=None, help="output directory for generated configs")
   ap.add_argument("--nproc-per-node", default=None, type=int, help="torchrun nproc_per_node (default: env or 8)")
   ap.add_argument("--dry-run", action="store_true", help="write configs and print commands, but do not launch")

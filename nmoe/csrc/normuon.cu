@@ -1,9 +1,9 @@
-// nmoe: CUDA Polar Express orthogonalization for NorMuon (BF16 I/O, FP32 accumulate)
+// nmoe: CUDA Polar Express orthogonalization (BF16 I/O, FP32 accumulate)
 //
 // Implements Polar Express sign method from https://arxiv.org/pdf/2505.16932
 // by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
 //
-// Coefficients match modded-nanogpt's NorMuon implementation (5 iterations).
+// Coefficients match modded-nanogpt's Polar Express implementation (5 iterations).
 //
 // API (C):
 //   void normuon_orth_bf16_inplace(void* x_bf16, long long B, int M, int N,
