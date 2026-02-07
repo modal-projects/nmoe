@@ -38,7 +38,7 @@ class Muon(torch.optim.Optimizer):
   Moonlight recipe (Muon is Scalable for LLM Training, arXiv:2502.16982):
   - SGD-Nesterov momentum base
   - Polar Express orthogonalization (Newton-Schulz, 5 steps)
-  - Per-matrix update scaling: 0.2 * sqrt(max(M, N)) (consistent update RMS)
+  - Per-matrix update scaling: update_rms * sqrt(max(M, N)) (consistent update RMS)
   - Standard decoupled weight decay (AdamW-style)
 
   Only use for 2D weight tensors (attention projections, MLP weights).
@@ -48,18 +48,16 @@ class Muon(torch.optim.Optimizer):
   def __init__(self, params, lr=3.4e-4, momentum=0.95, weight_decay=0.1, *, update_rms: float = 0.2):
     defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, update_rms=update_rms)
     super().__init__(params, defaults)
-    self._plan_cache = {}  # Cache muon plans by (M, N) shape
+    self._plan_cache = {}
 
   def _get_plan(self, M: int, N: int, Bmax: int = 32):
-    """Get or create a muon plan for shape (M, N)."""
     key = (M, N)
     if key not in self._plan_cache:
       ext = _get_muon_ext()
-      self._plan_cache[key] = ext.plan_create(Bmax, M, N)
+      self._plan_cache[key] = ext.plan_create(int(Bmax), int(M), int(N))
     return self._plan_cache[key]
 
   def __del__(self):
-    """Clean up muon plans."""
     ext = _get_muon_ext()
     for plan in self._plan_cache.values():
       try:
@@ -69,16 +67,15 @@ class Muon(torch.optim.Optimizer):
 
   @torch.no_grad()
   def step(self, closure=None):
-    """Perform a single optimization step."""
     if closure is not None:
       raise RuntimeError("Muon does not support closure")
 
     ext = _get_muon_ext()
 
     for group in self.param_groups:
-      lr = group['lr']
-      momentum = group['momentum']
-      wd = group['weight_decay']
+      lr = float(group['lr'])
+      momentum = float(group['momentum'])
+      wd = float(group['weight_decay'])
       update_rms = float(group.get('update_rms', 0.2))
 
       for p in group['params']:
@@ -96,35 +93,34 @@ class Muon(torch.optim.Optimizer):
           raise RuntimeError("Muon requires contiguous tensors")
 
         state = self.state[p]
+        M, N = grad.shape
 
-        # Initialize state
         if len(state) == 0:
           state['momentum_buffer'] = torch.zeros_like(grad)
 
         mom_buf = state['momentum_buffer']
 
-        # 1) Momentum update
+        # 1) Nesterov momentum
         mom_buf.lerp_(grad, 1 - momentum)
         update = grad.lerp(mom_buf, momentum).contiguous()
 
-        # 2) Polar Express orthogonalization
-        M, N = update.shape
+        # 2) Polar Express orthogonalization (batch=1)
         plan = self._get_plan(int(M), int(N))
         ext.plan_run(plan, update.data_ptr(), 1, int(M), int(N))
 
-        # 3) Moonlight scaling: update RMS ~ update_rms (default 0.2), independent of shape.
+        # 3) Moonlight scaling: update_rms * sqrt(max(M, N))
         if update_rms != 1.0:
           update.mul_(update_rms)
         update.mul_(math.sqrt(float(max(M, N))))
 
-        # 4) Standard decoupled weight decay (AdamW-style).
+        # 4) Decoupled weight decay (AdamW-style)
         if wd > 0.0:
-          p.mul_(1.0 - float(lr) * float(wd))
+          p.mul_(1.0 - lr * wd)
 
         # 5) Apply update
         if p.dtype != update.dtype:
           update = update.to(p.dtype)
-        p.sub_(update, alpha=float(lr))
+        p.sub_(update, alpha=lr)
 
 
 class ExpertMuon(torch.optim.Optimizer):
@@ -133,7 +129,7 @@ class ExpertMuon(torch.optim.Optimizer):
   Moonlight recipe (Muon is Scalable for LLM Training, arXiv:2502.16982):
   - SGD-Nesterov momentum base
   - Polar Express orthogonalization (Newton-Schulz, 5 steps)
-  - Per-matrix update scaling: 0.2 * sqrt(max(M, N)) (consistent update RMS)
+  - Per-matrix update scaling: update_rms * sqrt(max(M, N)) (consistent update RMS)
   - Standard decoupled weight decay (AdamW-style)
 
   Note: This optimizer is for expert matrices only. Non-matrix params remain on AdamW.
@@ -172,12 +168,12 @@ class ExpertMuon(torch.optim.Optimizer):
     ext = _get_muon_ext()
 
     for group in self.param_groups:
-      lr = float(group['lr'])
-      momentum = float(group['momentum'])
-      wd = float(group['weight_decay'])
-      update_rms = float(group.get('update_rms', 0.2))
+      lr = float(group["lr"])
+      momentum = float(group["momentum"])
+      wd = float(group["weight_decay"])
+      update_rms = float(group.get("update_rms", 0.2))
 
-      for p in group['params']:
+      for p in group["params"]:
         if p.grad is None:
           raise RuntimeError("ExpertMuon requires all expert grads to be present")
 
@@ -196,9 +192,9 @@ class ExpertMuon(torch.optim.Optimizer):
         E, M, N = grad.shape
 
         if len(state) == 0:
-          state['momentum_buffer'] = torch.zeros_like(grad)
+          state["momentum_buffer"] = torch.zeros_like(grad)
 
-        mom_buf = state['momentum_buffer']
+        mom_buf = state["momentum_buffer"]
 
         # 1) Momentum update
         mom_buf.lerp_(grad, 1 - momentum)
@@ -370,9 +366,9 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
       dense_groups: For ZeRO-2 AdamW (embeds, norms, biases, router)
   """
   use_muon = getattr(cfg, "use_muon", False)
-  muon_lr = getattr(cfg, "lr_muon", 0.023)
+  muon_lr = getattr(cfg, "lr_muon", 3.4e-4)
   muon_momentum = getattr(cfg, "muon_momentum", 0.95)
-  muon_wd = getattr(cfg, "muon_weight_decay", 1.2)
+  muon_wd = getattr(cfg, "muon_weight_decay", 0.1)
 
   # Collect parameters by type
   expert_named_params: list[tuple[str, torch.nn.Parameter]] = []
