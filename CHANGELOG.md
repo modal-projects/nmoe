@@ -2,7 +2,30 @@
 
 All notable changes to nmoe are documented here.
 
-## [Unreleased]
+## [2026-02-07] - v1.0: Public Release
+
+### Added
+- **Speedrun leaderboard** (`LEADERBOARD.json`): Canonical benchmarks for super (256 experts) and ultra (4096 experts) configs on B200 and H100
+- **Muon optimizer** (`nmoe/opt.py`): Moonlight recipe (SGD-Nesterov + Newton-Schulz orthogonalization + consistent update RMS)
+- **Multi-Token Prediction** (`nmoe/mtp.py`): MTP module matching paper eq 24
+- **Inference serving** (`nmoe/serve/`): Production serving with RDEP transport
+- **Distillation + PERL** (`nmoe/distill.py`, `nmoe/perl.py`): Knowledge distillation and parameter-efficient RL
+- **RL post-training** (`nmoe/rl/`): Comprehensive RL infrastructure
+- **CLI** (`n` command): `n speedrun`, `n train`, `n mon`, `n viz`, `n research`
+- **Bootstrap script** (`scripts/bootstrap.sh`): One-command setup for cloud GPU instances
+- **CORE eval integration**: 22-task eval suite runs automatically after speedrun
+
+### Changed
+- Default attention: MLA (Multi-head Latent Attention) for all layers
+- Tokenizer: `o200k_harmony` (vocab_size=201088)
+- Expert optimizer: Muon for fp8/nvfp4, AdamW for bf16
+
+### Golden Path
+```bash
+git clone https://github.com/Noumena-Network/nmoe.git && cd nmoe
+bash scripts/bootstrap.sh
+n speedrun
+```
 
 ## [2026-01-02] - Issue 07: Eval Framework
 
