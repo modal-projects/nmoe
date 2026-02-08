@@ -321,7 +321,7 @@ def _pick_master_port() -> int:
     return int(v)
   # Best-effort: pick an ephemeral localhost port.
   # This avoids hangs in environments where --standalone tries to resolve an
-  # unresolvable hostname (common in some k8s setups).
+  # unresolvable hostname (common in some container/Modal setups).
   s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   try:
     s.bind(("127.0.0.1", 0))

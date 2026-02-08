@@ -14,7 +14,7 @@ import torch.distributed as dist
 def _maybe_add_repo_third_party_to_sys_path(*, repo_root: str | Path | None = None) -> None:
   """Make vendored deps under repo-root/third_party importable.
 
-  The supported execution path is container-first; these vendored deps are part
+  The supported execution path is Modal-first; these vendored deps are part
   of the image checkout and should be importable without requiring users to
   manually extend PYTHONPATH.
   """

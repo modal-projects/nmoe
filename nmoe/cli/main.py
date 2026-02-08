@@ -57,7 +57,7 @@ NVIZ_PORT = _get_port("NVIZ_PORT", 3000)
 def _with_nmoe_env(env: dict | None = None) -> dict:
   """Return env with required PYTHONPATH for nmoe's vendored deps.
 
-  This makes `n speedrun` work in minimal environments (e.g. k8s debug pods)
+  This makes `n speedrun` work in minimal environments (e.g. Modal debug environments)
   without requiring users to manually export PYTHONPATH.
   """
   out = (env or os.environ).copy()

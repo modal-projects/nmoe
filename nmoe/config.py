@@ -233,7 +233,7 @@ class Config:
   # Evaluation (optional)
   # =============================================================================
   eval_enabled: bool = False
-  eval_mode: str = "reserved_gpu"  # inline | reserved_gpu | k8s_job
+  eval_mode: str = "reserved_gpu"  # inline | reserved_gpu | modal_job
   eval_every: int = 0               # steps; 0 disables
   eval_tasks: str = "core"         # optional shorthand; prefer tasks file
   eval_tasks_file: str = "configs/eval/core.toml"

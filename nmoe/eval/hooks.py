@@ -2,7 +2,7 @@
 Evaluation hooks for seamless integration with the training loop.
 
 Design goals:
-- Async-capable: spawn a separate process or write a ticket for K8s.
+- Async-capable: spawn a separate process or write a ticket for Modal/external runner.
 - Deterministic: eval snapshot contains config; runner is pure function of snapshot+args.
 - Minimal: no dependency on training internals beyond model/config/checkpointer.
 """
@@ -41,7 +41,7 @@ def maybe_schedule_eval(
     Modes:
       - inline: run synchronously on the current GPU (for smoke/dev)
       - reserved_gpu: spawn a subprocess bound to a specific GPU
-      - k8s_job: write a ticket JSON; an external job picks it up
+      - modal_job: write a ticket JSON; an external runner picks it up
     """
     if not getattr(cfg, "eval_enabled", False):
         return
@@ -93,7 +93,7 @@ def maybe_schedule_eval(
         subprocess.Popen(cmd, env=env)
         return
 
-    if mode == "k8s_job":
+    if mode in ("k8s_job", "modal_job"):
         # Emit a ticket for an external job/cron to consume.
         ticket = {
             "run": run_id,

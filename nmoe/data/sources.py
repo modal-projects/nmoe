@@ -40,7 +40,7 @@ def _get_datasets():
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
                 "Missing optional dependency `datasets` (HuggingFace). "
-                "Run dataset prep inside the container image with deps installed."
+                "Run dataset prep inside the Modal image with deps installed."
             ) from e
         _datasets = datasets
     return _datasets
@@ -54,7 +54,7 @@ def _get_pyarrow():
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
                 "Missing optional dependency `pyarrow` (required for Arrow/Parquet sources). "
-                "Run dataset prep inside the container image with deps installed."
+                "Run dataset prep inside the Modal image with deps installed."
             ) from e
         _pyarrow = pa
     return _pyarrow
@@ -144,7 +144,7 @@ class HuggingFaceSource(DataSource):
     def shard(self, *, num_shards: int, index: int) -> "HuggingFaceSource":
         """Return a deterministically sharded view of this source.
 
-        This is designed for K8s Indexed Jobs: each completion uses the same
+        This is designed for parallel jobs: each completion uses the same
         config, but a different `index` and a shared `num_shards`.
         """
         if num_shards <= 0:
@@ -579,7 +579,7 @@ class JSONLZstSource(DataSource):
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError(
                 "zstandard is required to read local .jsonl.zst files. "
-                "Use the dataprep container (docker/Dockerfile.dataprep installs it) "
+                "Run dataset prep inside the Modal image (which has it installed) "
                 "or install `zstandard` into your runtime."
             ) from e
 
@@ -707,7 +707,7 @@ class ArrowSource(DataSource):
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
                 "pyarrow.parquet is required for Parquet sources. "
-                "Run dataset prep inside the container image with deps installed."
+                "Run dataset prep inside the Modal image with deps installed."
             ) from e
 
         idx = 0
