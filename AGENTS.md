@@ -10,13 +10,14 @@ This means: no fallbacks, no hacks, no shortcuts. Production-grade, Google-quali
 ## Public Repo Contract
 
 - No internal-only paths, hostnames, IPs, or runbooks in tracked files.
-- The supported execution path is container-first (`docker/` + TOML configs).
+- The supported execution path is Modal-first (`modal/` + TOML configs).
+- `docker/` and `k8s/` are ARCHIVED -- retained as build reference only. Do not use for deployment.
 - Keep surfaces small: no second stacks for the same use-case.
 
 ## Execution Environment
 
-- Assume no usable GPU locally; prefer running via the provided Docker images and/or Kubernetes manifests.
-- Do not introduce a second installation path. If it is not container-first, it must be explicitly opt-in and documented.
+- Assume no usable GPU locally; prefer running via Modal (`modal run modal/train.py`).
+- Do not introduce a second execution path. If it is not Modal-first, it must be explicitly opt-in and documented.
 
 ## Agent Protocol (Failure Prevention)
 
@@ -30,7 +31,7 @@ This section exists because principles alone do not prevent repeated failures. T
 ### Mode Gates (Hard)
 **No-Edits Mode**
 - Trigger: user says “do not make edits/changes”, “review only”, or “planning/brainstorming”.
-- In this mode: do not modify tracked files, do not install deps, do not run destructive git ops, and do not change cluster state; only read/inspect/analyze.
+- In this mode: do not modify tracked files, do not install deps, do not run destructive git ops, and do not change Modal app state; only read/inspect/analyze.
 - Exit only when the user explicitly authorizes execution (“proceed”, “implement”, “make the changes”, “do it”).
 
 **Execution Mode**
@@ -74,7 +75,7 @@ Principles
 - Minimal dependencies: PyTorch + CuTeDSL + NVSHMEM. New layers must improve both clarity and performance.
 - One source of truth: one config format, one checkpoint format, one metrics schema. No duplicates to drift.
 - Test what matters: deterministic resume, conservation, invariants. No scaffolding that mirrors system complexity.
-- Container‑first reproducibility: controlled build/runtime; off‑target paths are explicit and opt‑in.
+- Modal‑first reproducibility: controlled build/runtime via `modal/` image definitions; off‑target paths are explicit and opt‑in.
 - Documentation that guides, not overwhelms: precise runbooks and remedies; zero fluff.
 
 Craftsmanship rubric for any change

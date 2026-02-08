@@ -15,7 +15,7 @@ instead of NCCL all-to-all collectives on the expert path.
 
 ## Quick start
 
-This repository is **container-first** (via `docker/`), with an explicit opt-in host bootstrap for cloud GPU instances.
+This repository is **Modal-first** (via `modal/`), with an explicit opt-in host bootstrap for cloud GPU instances.
 
 ### Speedrun (happy path)
 
@@ -44,17 +44,25 @@ n speedrun --leaderboard
 cat LEADERBOARD.json
 ```
 
-### Docker quick start
+### Modal quick start
 
-Boot a machine with B200 GPUs and run a minimal single-GPU smoke test (`moonlet`) inside the training image:
+Install the Modal CLI and authenticate:
 
 ```bash
-# Build the training image (builds base → system → deps → train)
-make -C docker train
+pip install modal
+modal setup
+```
 
-# Run single-GPU training (mount /data for datasets, checkpoints, metrics)
-docker run --gpus all -v /data:/data xjdr/nmoe_train:latest \
-  python -m nmoe.train configs/moonlet.toml
+Run single-GPU training (moonlet):
+
+```bash
+modal run modal/train.py --config configs/moonlet.toml
+```
+
+8-GPU training (moonlight):
+
+```bash
+modal run modal/train.py --config configs/moonlight.toml --gpus 8
 ```
 
 ## Multi-GPU (single-node)
@@ -65,7 +73,7 @@ Single-node (8×GPU) training:
 torchrun --standalone --nproc_per_node=8 -m nmoe.train configs/moonlight.toml
 ```
 
-Kubernetes manifests in `k8s/` are templates for single-node training, NVIZ, and profiling; edit hostnames, images, and storage before deploying.
+Modal app definitions in `modal/` provide training, data prep, and debug environments. Docker images in `docker/` and K8s manifests in `k8s/` are archived for reference.
 
 ## Configs
 

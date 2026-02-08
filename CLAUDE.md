@@ -21,7 +21,7 @@ In this mode:
 - Do NOT modify tracked files
 - Do NOT install deps
 - Do NOT run destructive git operations
-- Do NOT change cluster state
+- Do NOT change Modal app state
 - ONLY read/inspect/analyze
 
 Exit only when user explicitly authorizes: "proceed", "implement", "make the changes"
@@ -52,7 +52,7 @@ For wide-ranging changes (new public APIs, multi-file refactors, kernel/distribu
 ## Commands / Output
 - Provide complete copy/paste-ready commands (include `cd`, env vars, and flags)
 - If asked for "full diff/log output", do NOT truncate
-- Avoid host side effects outside containers unless explicitly requested
+- Avoid host side effects outside Modal functions unless explicitly requested
 
 ## Approval Protocol
 - Wait for explicit approval ("yes" / "proceed" / "ok" / "do it") before executing significant actions
@@ -71,7 +71,7 @@ For wide-ranging changes (new public APIs, multi-file refactors, kernel/distribu
 6. **Minimal dependencies**: PyTorch + CuTeDSL. New layers must improve both clarity and performance.
 7. **One source of truth**: One config format, one checkpoint format, one metrics schema. No duplicates to drift.
 8. **Test what matters**: Deterministic resume, conservation, invariants. No scaffolding that mirrors system complexity.
-9. **Container-first reproducibility**: Controlled build/runtime; off-target paths are explicit and opt-in.
+9. **Modal-first reproducibility**: Controlled build/runtime via `modal/` image definitions; off-target paths are explicit and opt-in.
 10. **Documentation that guides, not overwhelms**: Precise runbooks and remedies; zero fluff.
 
 ---
@@ -183,10 +183,11 @@ We borrow ideas; we do not depend on these at runtime.
 - If continuing from previous session, review conversation history/summary
 
 ## Execution Environment (Public Contract)
-- Supported execution path is container-first (`docker/` + TOML configs).
+- Supported execution path is Modal-first (`modal/` + TOML configs).
 - Host bootstrap (`scripts/bootstrap.sh`) is explicitly opt-in for quick iteration on cloud instances.
 - Do not commit provider/cluster runbooks, hostnames, IPs, or secrets into tracked files.
-- If you need GPUs, run where GPUs exist (container/Kubernetes/remote host); do not pretend-run GPU code locally.
+- If you need GPUs, run via Modal (`modal run modal/train.py`) or where GPUs exist (remote host); do not pretend-run GPU code locally.
+- `docker/` and `k8s/` are ARCHIVED -- retained as build reference only. Do not use them for deployment; use `modal/` instead. Delete once Modal has full feature parity.
 
 ## CUDA Build Protocol
 - ONLY run `make` when CUDA source files (*.cu, *.cuh, *.cpp in csrc/) actually changed
@@ -194,6 +195,7 @@ We borrow ideas; we do not depend on these at runtime.
 - Check timestamps: `ls -la nmoe/csrc/*.so` (or equivalent inside your container/remote env)
 - NEVER use `make clean` unless absolutely necessary
 - Full CUDA rebuild takes 45+ minutes - unnecessary rebuilds are unacceptable
+- Modal image layers cache the kernel build; rebuild only happens when nmoe/csrc/ source changes
 
 ## Config Management
 - When training fails, FIRST check config, not code - stable code exists
@@ -290,7 +292,7 @@ Awaiting approval to proceed.
 5. **LAZY TROUBLESHOOTING** - Every diagnosis needs supporting data
 6. **SCATTERED IMPORTS** - All imports at top, tab = 2 spaces
 7. **CONFIG EXPLOSION** - Update existing configs, don't create new ones
-8. **RUNNING GPU CODE WITHOUT GPU** - Use the supported container/remote execution path
+8. **RUNNING GPU CODE WITHOUT GPU** - Use Modal (`modal run`) or the supported remote execution path
 9. **VERBOSITY WHEN ACTION REQUESTED** - "just X" means do X immediately
 10. **IGNORING CONVERSATION HISTORY** - Previous working configs may be in history
 11. **IMPLEMENTING BEFORE APPROVAL** - Propose first, wait for explicit approval
