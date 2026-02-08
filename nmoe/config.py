@@ -136,6 +136,7 @@ class Config:
   checkpoint_dir: str = "/data/checkpoints"
   checkpoint_every: int = 1000
   checkpoint_keep_last_n: int = 3
+  fsync: bool = True  # fsync checkpoint files after write; disable on 9p/FUSE volumes
   resume: bool = True
 
   # =============================================================================
