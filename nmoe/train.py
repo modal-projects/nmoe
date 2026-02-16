@@ -30,7 +30,7 @@ from nmoe.config import Config, fingerprint, upgrade_cfg_dict
 from nmoe.model import Transformer, MoE
 from nmoe.data.loader import build_loader
 from nmoe.opt import build_optimizer, update_lr, step
-from nmoe.checkpoint import Checkpointer, load_checkpoint, save_checkpoint
+from nmoe.checkpoint import Checkpointer, load_checkpoint, save_checkpoint, set_fsync
 from nmoe.metrics import init_metrics, start_metrics, log_training_step, stop_metrics, register_model_timers, cuda_time, collect_router_stats
 from nmoe.experiments import ExperimentTracker
 from nmoe.eval.hooks import maybe_schedule_eval
@@ -253,6 +253,7 @@ def train(cfg: Config):
     if len(run_id) == 0:
       raise RuntimeError("broadcast run_id is empty")
 
+  set_fsync(cfg.fsync)
   checkpointer = Checkpointer(
     base=cfg.checkpoint_dir,
     keep_last=getattr(cfg, 'checkpoint_keep_last_n', 5),
@@ -754,7 +755,6 @@ def train(cfg: Config):
       except Exception as e:
         if rank == 0:
           print(f"[core] failed: {e}")
-
     final_loss = float(last_loss.item()) if last_loss is not None else 0.0
     wall_ms = (time.perf_counter() - wall_t0) * 1000.0
     train_ms = wall_ms - (valid_time_s * 1000.0)

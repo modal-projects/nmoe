@@ -66,9 +66,14 @@ def _resolve_runtime_deps() -> list[str]:
   deps.append("modal")
   return deps
 
-# -- Volume ----------------------------------------------------------------
+# -- Volumes ---------------------------------------------------------------
+# Data (training shards, eval bundles) lives on a v2 Volume for high file
+# counts and concurrent reads.  Checkpoints go to a v1 Volume — v2's FUSE
+# layer has severe write amplification with torch.save's small-write pickle
+# protocol (~10 MB/s effective), while v1 sustains ~350 MB/s.
 
 data_vol = modal.Volume.from_name("nmoe-data", create_if_missing=True)
+checkpoint_vol = modal.Volume.from_name("nmoe-data-v1")
 
 # -- Source mount ignore list (shared between nmoe_image and debug_image) ---
 

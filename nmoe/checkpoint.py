@@ -17,6 +17,12 @@ from nmoe.data.mixture import MixturePlan, resolve_plan
 
 
 TRACKER = "latest_checkpointed_iteration.txt"
+_fsync_enabled = True
+
+
+def set_fsync(enabled: bool) -> None:
+  global _fsync_enabled
+  _fsync_enabled = enabled
 
 
 def _is_dist() -> bool:
@@ -48,10 +54,11 @@ def write_tracker(base: str | Path, step: int) -> None:
     with open(tmp, "w") as f:
         f.write(str(int(step)))
         f.flush()
-        try:
-            os.fsync(f.fileno())
-        except Exception:
-            pass
+        if _fsync_enabled:
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
     os.replace(tmp, out)
     try:
         _fsync_file(out)
@@ -143,6 +150,8 @@ def _materialize_to_cpu_sync(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _fsync_file(path: str) -> None:
+    if not _fsync_enabled:
+        return
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -151,6 +160,8 @@ def _fsync_file(path: str) -> None:
 
 
 def _fsync_dir(path: str) -> None:
+    if not _fsync_enabled:
+        return
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -226,7 +237,8 @@ def _write_manifest(base: str | Path, step: int, world: int) -> None:
     with open(tmp, 'w') as f:
         json.dump(manifest, f, indent=2)
         f.flush()
-        os.fsync(f.fileno())
+        if _fsync_enabled:
+            os.fsync(f.fileno())
     os.replace(tmp, out)
     _fsync_file(out)
     _fsync_dir(it_dir)
